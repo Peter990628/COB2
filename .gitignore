@@ -1,0 +1,13 @@
+# Python 임시 파일 제거
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# ROS 빌드 및 로그 관련 안전장치
+build/
+install/
+log/
+.catkin_tools/
+
+.vscode
