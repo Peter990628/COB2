@@ -24,6 +24,10 @@ setup(
     },
     entry_points={
         'console_scripts': [
+            'gripper_test = peter.gripper_test:main',
+            'go_home = peter.go_home:main',
+            'jog_complete = peter.jog_complete:main',
+            'get_current_pose = peter.get_current_pose:main',
         ],
     },
 )
