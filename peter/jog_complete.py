@@ -1,7 +1,7 @@
 import rclpy
 import DR_init
 import tkinter as tk
-
+from peter.onrobot import RG
 
 # Configuration for a single robot
 ROBOT_ID = "dsr01"
@@ -19,6 +19,7 @@ def main(args=None):
     rclpy.init(args=args)
     node = rclpy.create_node("dsr_rokey_basic_py", namespace=ROBOT_ID)
     DR_init.__dsr__node = node
+    gripper = RG("rg2", "192.168.1.1", 502)
 
     # Import robot functions
     try:
@@ -207,15 +208,17 @@ def main(args=None):
             pass
 
     def release():
-        set_digital_output(2, ON)
-        set_digital_output(1, OFF)
-        wait_digital_input(2)
+        gripper.open_gripper()
+        # set_digital_output(2, ON)
+        # set_digital_output(1, OFF)
+        # wait_digital_input(2)
 
     def grip():
-        release()
-        set_digital_output(1, ON)
-        set_digital_output(2, OFF)
-        wait_digital_input(1)
+        gripper.close_gripper()
+        
+        # set_digital_output(1, ON)
+        # set_digital_output(2, OFF)
+        # wait_digital_input(1)
 
     # UI setup
     root = tk.Tk()
