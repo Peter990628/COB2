@@ -1,0 +1,7 @@
+# 요청할 음료 이름: 커피, 콜라, 차, 식혜
+string beverage
+---
+# true는 작업이 접수되었음을 의미합니다.
+# 최종 성공/실패는 /dsr01/beverage_status 토픽으로 발행됩니다.
+bool accepted
+string message

@@ -1,0 +1,7 @@
+#!/usr/bin/env python3
+
+from peter.jog_complete import main
+
+
+if __name__ == "__main__":
+    main()

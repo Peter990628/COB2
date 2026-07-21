@@ -1,0 +1,7 @@
+#!/usr/bin/env python3
+
+from peter.get_current_pos import main
+
+
+if __name__ == "__main__":
+    main()
