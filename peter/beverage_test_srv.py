@@ -63,19 +63,19 @@ BEVERAGE_PICK_POSES: Dict[
     str, Optional[Tuple[float, float, float, float, float, float]]
 ] = {
     "coffee": (319.059, -477.25, 74.607, 121.975, 179.937, -149.095),
-    "cola": None,
-    "tea": None,
-    "sikhye": None,
+    "cola": (394.059, -477.25, 74.607, 121.975, 179.937, -149.095),
+    "tea": (469.059, -477.25, 74.607, 121.975, 179.937, -149.095),
+    "sikhye": (544.059, -477.25, 74.607, 121.975, 179.937, -149.095),
 }
 
 # RG2 raw 단위: width=0.1 mm, force=0.1 N.
 # 아래 값은 안전한 초기 테스트용 placeholder입니다. 캔 외경과 핑거 형상에
 # 맞춰 각 음료의 폭을 실측하고, 실제 운전 전에 반드시 다시 조정하세요.
 DEFAULT_GRIP_PROFILES = {
-    "tea": (630, 30),
-    "cola": (630, 30),
-    "coffee": (630, 30),
-    "sikhye": (630, 30),
+    "tea": (500, 200),
+    "cola": (500, 200),
+    "coffee": (500, 200),
+    "sikhye": (500, 200),
 }
 
 DR_init.__dsr__id = ROBOT_ID
