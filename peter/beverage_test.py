@@ -85,10 +85,10 @@ publishing this command.
 # 5. 음료 선택 토픽 형식 예시입니다. 아래 숫자는 dry-run용 임의값이며,
 #    실제 운전에는 사용하지 마세요. Pose는 DR_BASE 기준 TCP 자세입니다.
 #
-#    ros2 topic pub --once /dsr01/beverage_selection \
-#      std_msgs/msg/String \
-#      "{data: '콜라,400,100,250,180,0,90'}"
-#
+
+            #   <강사님 방향 기준 맨 왼쪽>
+# ros2 topic pub --once /dsr01/beverage_selection std_msgs/msg/String "{data: '커피,319.059, -477.25, 74.607, 121.975, 179.937, -149.095'}"
+
 # 아래 명령은 네 음료의 복사·수정용 템플릿입니다. PICK_X 등의 글자를
 # 실제로 티칭한 [X,Y,Z,A,B,C] 숫자로 바꾼 뒤 사용하세요. 잘못된 예시 좌표로
 # 실제 로봇이 움직이지 않도록 일부러 숫자 placeholder를 넣지 않았습니다.
@@ -328,7 +328,7 @@ class BeverageNode(Node):
         # place_approach_pose: 트레이/배치 위치 위쪽의 안전한 접근 TCP pose
         # release_z_mm: 같은 X,Y,A,B,C를 유지하고 내려가 캔을 놓을 최종 BASE Z
         self.declare_parameter(
-            "place_approach_pose", [278.016, 54.962, 174.347, 16.884, -178.725, 16.126]
+            "place_approach_pose", [281.662, 43.451, 173.977, 16.839, -178.666, 16.09]
         )
         self.declare_parameter("release_z_mm", 110.0)
         self.declare_parameter("retreat_mm", 150.0)
@@ -412,6 +412,7 @@ class BeverageNode(Node):
         self._dr_mv_mod_abs = None
         self._dr_mv_mod_rel = None
         self._robot_mode_autonomous = None
+        self.wait = None
 
         if self._dry_run:
             self.get_logger().warning(
@@ -526,6 +527,7 @@ class BeverageNode(Node):
                 movel,
                 movej,
                 set_robot_mode,
+                wait
             )
 
             self._posx = posx
@@ -537,7 +539,7 @@ class BeverageNode(Node):
             self._dr_mv_mod_abs = DR_MV_MOD_ABS
             self._dr_mv_mod_rel = DR_MV_MOD_REL
             self._robot_mode_autonomous = ROBOT_MODE_AUTONOMOUS
-
+            self.wait = wait
             self._gripper = RG(
                 "rg2",
                 str(self.get_parameter("gripper.ip").value),
@@ -733,6 +735,8 @@ class BeverageNode(Node):
                 self._normal_acc,
                 "retreat",
             )
+            self.wait(1.0)  # 그리퍼가 완전히 열린 뒤에만 홈 이동
+            self._move_to_home()
 
             self.get_logger().info(f"{label} 배치 완료")
             self._publish_status("succeeded", beverage=request.beverage)
