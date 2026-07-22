@@ -48,7 +48,7 @@ setup(
             'move_to_bev = hotel_vision.move_to_bev:main',
             'move_to_bev_opencv = hotel_vision.move_to_bev_opencv:main',
             'opencv_center_test = hotel_vision.opencv_center_test:main',
-
+            'realsense_capture = train.realsense_dataset_capture_node:main',
 
         ],
     },

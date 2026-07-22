@@ -1,4 +1,4 @@
-"""OpenCV 원 검출로 캔 윗면 중심을 보정하여 수직 파지하는 ROS 2 노드."""
+"""OpenCV로 캔 중심을 보정해 수직 파지하고 트레이에 배치하는 ROS 2 노드."""
 # move_to_bev_opencv
 import math
 import time
@@ -55,18 +55,42 @@ VERTICAL_TOOL_ABC = [90.0, -180.0, -90.0]
 
 # detector가 준 캔 좌표보다 BASE +Z 방향으로 올라갈 거리 (mm)
 ROUGH_APPROACH_Z_OFFSET_MM = 80.0 
-SAFE_CLEARANCE_ABOVE_CAN_MM = 150.0
+SAFE_CLEARANCE_ABOVE_CAN_MM = 100.0
 
 # 검출된 캔 윗면보다 최종 TCP가 얼마나 위에 있어야 하는지 정하는 값이다.
 # TCP가 실제 그리퍼 파지 중심에 설정되어 있는지 확인한 후 보정해야 한다.
-# 거친 접근이 캔 위 100 mm라면 이 값 50 mm에서 하강량은 대략 50 mm가 된다.
+# 최종 하강량은 현재 TCP Z - (검출된 캔 윗면 Z + 이 값)으로 계산된다.
 GRASP_TCP_Z_OFFSET_FROM_CAN_TOP_MM = -30.0
 MIN_FINAL_DESCENT_MM = 5.0
 MAX_FINAL_DESCENT_MM = 120.0
 
-# True이면 최종 하강과 파지를 실행한다. ROI와 좌표를 먼저 확인할 수 있도록
-# 기본값은 False이다. 충분히 검증한 뒤에만 True로 바꾼다.
+# True이면 최종 하강과 파지를 실행한다. ROI와 좌표를 먼저 확인하려면
+# False로 두고, 충분히 검증한 뒤에만 True로 바꾼다.
 ENABLE_FINAL_DESCENT_AND_GRIP = True
+
+# 파지 후 beverage_test_srv와 같은 트레이 배치 작업까지 실행할지 정한다.
+# 실제 로봇에서 True로 실행하기 전에 아래 접근 pose와 release Z를 반드시
+# 티칭한 트레이 좌표와 대조한다.
+ENABLE_TRAY_PLACE = True
+
+# 트레이 위의 안전한 접근 TCP pose [X, Y, Z, A, B, C] (BASE, mm/deg)
+PLACE_APPROACH_POSE = [
+    281.662,
+    43.451,
+    173.977,
+    16.839,
+    -178.666,
+    16.09,
+]
+
+# PLACE_APPROACH_POSE의 X/Y/A/B/C를 유지한 채 캔을 놓을 TCP의 BASE Z
+PLACE_RELEASE_Z_MM = 110.0
+
+# 캔을 들고 수평 이동하거나 놓은 뒤 빠져나올 때 release Z보다 확보할 높이
+PLACE_RETREAT_CLEARANCE_MM = 150.0
+
+# True이면 배치 후 안전 높이까지 후퇴한 다음 초기 관절 자세로 돌아간다.
+RETURN_TO_INITIAL_POSE_AFTER_PLACE = False
 
 JOINT_VELOCITY = 30.0
 JOINT_ACCELERATION = 30.0
@@ -97,8 +121,8 @@ BASE_Y_RANGE_MM = (-800.0, 800.0)
 BASE_Z_RANGE_MM = (-100.0, 900.0)
 MAX_BASE_XY_RADIUS_MM = 850.0
 
-# OnRobot RG2 raw 단위: width=0.1 mm, force=0.1 N
-# 캔 지름 약 66 mm보다 조금 작은 62 mm, 낮은 힘 3 N부터 시작한다.
+# OnRobot RG2 raw 단위: width=0.1 mm, force=0.1 N.
+# 아래 현재값은 파지 폭 50.0 mm, 파지력 20.0 N이다.
 GRIPPER_IP = "192.168.1.1"
 GRIPPER_PORT = 502
 GRIPPER_OPEN_WIDTH_RAW = 700
@@ -134,6 +158,32 @@ def extract_pose_values(raw_pose, description: str) -> np.ndarray:
     if values.size != 6 or not np.all(np.isfinite(values)):
         raise RuntimeError(
             f"{description}가 유효한 6축 pose가 아닙니다: {raw_pose}"
+        )
+    return values
+
+
+def validate_base_pose(raw_pose, description: str) -> np.ndarray:
+    """BASE 절대 pose가 설정된 작업 범위 안에 있는지 확인한다."""
+    values = extract_pose_values(raw_pose, description)
+    x, y, z = (float(value) for value in values[:3])
+
+    if not BASE_X_RANGE_MM[0] <= x <= BASE_X_RANGE_MM[1]:
+        raise ValueError(
+            f"{description} X={x:.1f} mm가 작업 범위 {BASE_X_RANGE_MM} 밖입니다."
+        )
+    if not BASE_Y_RANGE_MM[0] <= y <= BASE_Y_RANGE_MM[1]:
+        raise ValueError(
+            f"{description} Y={y:.1f} mm가 작업 범위 {BASE_Y_RANGE_MM} 밖입니다."
+        )
+    if not BASE_Z_RANGE_MM[0] <= z <= BASE_Z_RANGE_MM[1]:
+        raise ValueError(
+            f"{description} Z={z:.1f} mm가 작업 범위 {BASE_Z_RANGE_MM} 밖입니다."
+        )
+    xy_radius = math.hypot(x, y)
+    if xy_radius > MAX_BASE_XY_RADIUS_MM:
+        raise ValueError(
+            f"{description} BASE XY 반경={xy_radius:.1f} mm가 "
+            f"한계 {MAX_BASE_XY_RADIUS_MM:.1f} mm를 넘습니다."
         )
     return values
 
@@ -204,6 +254,15 @@ def command_gripper(
         if status[0] == 0:
             if require_grip and status[1] != 1:
                 raise RuntimeError("RG2가 캔 파지를 감지하지 못했습니다.")
+            if not require_grip:
+                actual_width = float(gripper.get_width_with_offset())
+                target_width = width_raw / 10.0
+                if abs(actual_width - target_width) > 3.0:
+                    raise RuntimeError(
+                        "RG2 열림 폭이 목표에 도달하지 못했습니다: "
+                        f"target={target_width:.1f} mm, "
+                        f"actual={actual_width:.1f} mm"
+                    )
             logger.info(f"{description} 완료")
             return
         time.sleep(0.1)
@@ -561,6 +620,7 @@ def main(args=None) -> None:
     receiver_node = None
     vision_node = None
     gripper = None
+    holding_object = False
 
     try:
         # DSR_ROBOT2 import 전에 반드시 DR_init에 생성된 노드를 넣어야 한다.
@@ -581,6 +641,47 @@ def main(args=None) -> None:
             posj,
             posx,
         )
+
+        place_approach = None
+        place_release = None
+        place_min_transport_z = None
+        if ENABLE_TRAY_PLACE:
+            place_approach = validate_base_pose(
+                PLACE_APPROACH_POSE,
+                "트레이 접근 pose",
+            )
+            if np.allclose(place_approach, 0.0, atol=1.0e-9):
+                raise ValueError(
+                    "PLACE_APPROACH_POSE가 모두 0인 placeholder입니다."
+                )
+            if not math.isfinite(PLACE_RELEASE_Z_MM):
+                raise ValueError("PLACE_RELEASE_Z_MM은 유한한 값이어야 합니다.")
+            if PLACE_RELEASE_Z_MM >= float(place_approach[2]):
+                raise ValueError(
+                    "PLACE_RELEASE_Z_MM은 PLACE_APPROACH_POSE의 Z보다 "
+                    "작아야 합니다."
+                )
+            if (
+                not math.isfinite(PLACE_RETREAT_CLEARANCE_MM)
+                or PLACE_RETREAT_CLEARANCE_MM <= 0.0
+            ):
+                raise ValueError(
+                    "PLACE_RETREAT_CLEARANCE_MM은 유한한 양수여야 합니다."
+                )
+
+            place_release = place_approach.copy()
+            place_release[2] = PLACE_RELEASE_Z_MM
+            validate_base_pose(place_release, "트레이 release pose")
+
+            # 이 값이 잘못되어 있으면 캔을 잡은 뒤가 아니라 로봇을 움직이기
+            # 전에 중단하도록 미리 검사한다.
+            place_min_transport_z = max(
+                float(place_approach[2]),
+                float(place_release[2]) + PLACE_RETREAT_CLEARANCE_MM,
+            )
+            configured_transport = place_approach.copy()
+            configured_transport[2] = place_min_transport_z
+            validate_base_pose(configured_transport, "트레이 안전 운반 pose")
 
         # 변환행렬이 없으면 로봇을 움직이기 전에 즉시 중단한다.
         flange_to_camera = load_flange_camera_transform()
@@ -721,7 +822,7 @@ def main(args=None) -> None:
             "안전 높이 XY 접근 movel",
         )
 
-        # 4) 수직 자세를 유지하고 거친 캔 좌표의 +Z 100 mm까지 내려간다.
+        # 4) 수직 자세를 유지하고 거친 캔 좌표에서 설정한 +Z까지 내려간다.
         rough_pose_values = [
             received["x"],
             received["y"],
@@ -871,6 +972,9 @@ def main(args=None) -> None:
             DR_MV_MOD_REL,
             "최종 BASE -Z 하강 movel",
         )
+        # 명령 전송 뒤 통신/상태 확인이 실패해도 실제로 캔을 잡았을 수 있으므로
+        # 이 시점부터 보수적으로 holding 상태로 취급한다.
+        holding_object = True
         try:
             command_gripper(
                 gripper,
@@ -911,12 +1015,181 @@ def main(args=None) -> None:
             "OpenCV 기반 캔 수직 파지 및 접근 높이 복귀를 완료했습니다."
         )
 
+        if not ENABLE_TRAY_PLACE:
+            robot_node.get_logger().warning(
+                "ENABLE_TRAY_PLACE=False이므로 캔을 든 상태에서 배치 작업을 "
+                "생략합니다. 로봇/그리퍼를 수동 조작하기 전에 상태를 "
+                "확인하세요."
+            )
+            return
+
+        if (
+            place_approach is None
+            or place_release is None
+            or place_min_transport_z is None
+        ):
+            raise RuntimeError("트레이 배치 설정이 초기화되지 않았습니다.")
+
+        # 9) 캔을 든 상태에서는 곧바로 대각선 이동하지 않는다. 현재 XY에서
+        # 먼저 안전 운반 높이까지 수직 상승한 뒤 트레이 위로 수평 이동한다.
+        lifted_tcp = extract_pose_values(
+            get_current_posx(ref=DR_BASE),
+            "파지 후 상승 TCP pose",
+        )
+        transport_z = max(
+            float(lifted_tcp[2]),
+            place_min_transport_z,
+        )
+        if transport_z > BASE_Z_RANGE_MM[1]:
+            raise RuntimeError(
+                f"계산된 트레이 운반 높이 {transport_z:.1f} mm가 Z 작업 "
+                f"범위 {BASE_Z_RANGE_MM} 밖입니다."
+            )
+
+        pick_transport_values = [
+            float(lifted_tcp[0]),
+            float(lifted_tcp[1]),
+            transport_z,
+            *[float(value) for value in lifted_tcp[3:6]],
+        ]
+        validate_base_pose(pick_transport_values, "파지 위치 안전 운반 pose")
+        if transport_z - float(lifted_tcp[2]) > 0.5:
+            robot_node.get_logger().info(
+                "캔을 든 채 현재 XY에서 안전 운반 높이로 상승: "
+                f"Z={transport_z:.1f} mm"
+            )
+            checked_movel(
+                movel,
+                posx(pick_transport_values),
+                LINEAR_VELOCITY,
+                LINEAR_ACCELERATION,
+                DR_BASE,
+                DR_MV_MOD_ABS,
+                "파지 후 안전 운반 높이 상승 movel",
+            )
+
+        # 먼저 파지 자세를 그대로 유지한 채 트레이 X/Y 위로 수평 이동한다.
+        tray_above_vertical_values = [
+            float(place_approach[0]),
+            float(place_approach[1]),
+            transport_z,
+            *[float(value) for value in lifted_tcp[3:6]],
+        ]
+        validate_base_pose(
+            tray_above_vertical_values,
+            "수직 파지 자세의 트레이 안전 운반 pose",
+        )
+        robot_node.get_logger().info(
+            "수직 파지 자세를 유지하고 트레이 위로 이동: "
+            f"{tray_above_vertical_values}"
+        )
+        checked_movel(
+            movel,
+            posx(tray_above_vertical_values),
+            LINEAR_VELOCITY,
+            LINEAR_ACCELERATION,
+            DR_BASE,
+            DR_MV_MOD_ABS,
+            "트레이 위 안전 운반 movel",
+        )
+
+        # 트레이 위 안전 높이에 도착한 뒤에만 배치용 ABC로 자세를 바꾼다.
+        place_transport_values = [
+            float(place_approach[0]),
+            float(place_approach[1]),
+            transport_z,
+            *[float(value) for value in place_approach[3:6]],
+        ]
+        validate_base_pose(place_transport_values, "트레이 배치 자세 pose")
+        robot_node.get_logger().info(
+            f"트레이 위 안전 높이에서 배치 자세로 정렬: {place_transport_values}"
+        )
+        checked_movel(
+            movel,
+            posx(place_transport_values),
+            FINE_LINEAR_VELOCITY,
+            FINE_LINEAR_ACCELERATION,
+            DR_BASE,
+            DR_MV_MOD_ABS,
+            "트레이 위 배치 자세 정렬 movel",
+        )
+
+        # 10) 트레이 접근점과 release Z까지 차례로 수직 하강한다.
+        robot_node.get_logger().info(
+            f"트레이 접근 pose로 하강: {place_approach.tolist()}"
+        )
+        checked_movel(
+            movel,
+            posx(place_approach.tolist()),
+            LINEAR_VELOCITY,
+            LINEAR_ACCELERATION,
+            DR_BASE,
+            DR_MV_MOD_ABS,
+            "트레이 접근 movel",
+        )
+        robot_node.get_logger().info(
+            f"트레이 release Z로 천천히 하강: {place_release.tolist()}"
+        )
+        checked_movel(
+            movel,
+            posx(place_release.tolist()),
+            FINE_LINEAR_VELOCITY,
+            FINE_LINEAR_ACCELERATION,
+            DR_BASE,
+            DR_MV_MOD_ABS,
+            "트레이 release 하강 movel",
+        )
+
+        # 11) 목표 높이에서 캔을 놓고 같은 경로로 안전 높이까지 후퇴한다.
+        command_gripper(
+            gripper,
+            robot_node.get_logger(),
+            GRIPPER_OPEN_WIDTH_RAW,
+            GRIPPER_FORCE_RAW,
+            require_grip=False,
+            description="트레이에 캔 놓기",
+        )
+        holding_object = False
+        checked_movel(
+            movel,
+            posx(place_transport_values),
+            LINEAR_VELOCITY,
+            LINEAR_ACCELERATION,
+            DR_BASE,
+            DR_MV_MOD_ABS,
+            "배치 후 안전 높이 후퇴 movel",
+        )
+
+        if RETURN_TO_INITIAL_POSE_AFTER_PLACE:
+            robot_node.get_logger().info("배치 후 초기 관절 자세로 복귀합니다.")
+            return_home_result = movej(
+                posj(INITIAL_JOINT_POSE),
+                vel=JOINT_VELOCITY,
+                acc=JOINT_ACCELERATION,
+            )
+            if return_home_result != 0:
+                raise RuntimeError(
+                    "배치 후 초기 movej 실패, "
+                    f"반환값: {return_home_result}"
+                )
+
+        robot_node.get_logger().info("캔 트레이 배치를 완료했습니다.")
+
     except KeyboardInterrupt:
         if robot_node is not None:
             robot_node.get_logger().info("사용자 요청으로 종료합니다.")
+            if holding_object:
+                robot_node.get_logger().warning(
+                    "캔을 들고 있을 수 있어 그리퍼를 자동으로 열지 않습니다."
+                )
     except Exception as error:
         if robot_node is not None:
             robot_node.get_logger().error(f"move_to_bev_opencv 오류: {error}")
+            if holding_object:
+                robot_node.get_logger().error(
+                    "캔을 들고 있을 수 있어 그리퍼를 자동으로 열지 않습니다. "
+                    "로봇 상태와 주변 안전을 먼저 확인하세요."
+                )
         else:
             print(f"move_to_bev_opencv 노드 생성 실패: {error}")
         raise
