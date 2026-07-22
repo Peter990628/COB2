@@ -24,10 +24,11 @@ DR_init.__dsr__model = ROBOT_MODEL
 
 
 # 실행 시 처음 이동할 관절 자세 [J1, J2, J3, J4, J5, J6] (deg)
-INITIAL_JOINT_POSE = [20.0, 25.0, 85.0, -50.0, 100.0, 210.0]
-
+INITIAL_JOINT_POSE = [23.559, 16.219, 97.41, -51.183, 95.124, 210.84]
+# [20.0, 25.0, 85.0, -50.0, 100.0, 210.0]
+# [23.559, 16.219, 97.41, -51.183, 95.124, 210.84]
 # 캔 위쪽 접근점까지 이동할 때 사용할 TCP 자세 [A, B, C] (deg)
-TARGET_ABC = [83.411, -122.476, -91.566]
+TARGET_ABC = [ 90.54, -122.504, -91.429]
 
 # 캔 좌표를 기준으로 한 BASE 좌표계 이동량 (mm)
 ABOVE_CAN_Z_OFFSET_MM = 50.0
@@ -35,7 +36,7 @@ BASE_Y_ADJUST_MM = -25.0
 BASE_Z_DESCENT_MM = -25.0
 
 # TOOL Z축이 BASE -Z 방향을 보도록 만드는 수직 파지 자세 (deg)
-VERTICAL_TOOL_ABC = [0.0, -180.0, -90.0]
+VERTICAL_TOOL_ABC = [90.0, -180.0, -90.0]
 
 JOINT_VELOCITY = 30.0
 JOINT_ACCELERATION = 30.0

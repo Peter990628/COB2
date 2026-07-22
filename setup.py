@@ -46,7 +46,8 @@ setup(
             'beverage_detector_node = hotel_vision.beverage_detector_node:main',
             'simple_movej_node = hotel_vision.simple_movej_node:main',
             'move_to_bev = hotel_vision.move_to_bev:main',
-            
+            'move_to_bev_opencv = hotel_vision.move_to_bev_opencv:main',
+            'opencv_center_test = hotel_vision.opencv_center_test:main',
 
 
         ],
