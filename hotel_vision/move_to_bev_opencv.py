@@ -87,7 +87,7 @@ PLACE_APPROACH_POSE = [
 PLACE_RELEASE_Z_MM = 110.0
 
 # 캔을 들고 수평 이동하거나 놓은 뒤 빠져나올 때 release Z보다 확보할 높이
-PLACE_RETREAT_CLEARANCE_MM = 150.0
+PLACE_RETREAT_CLEARANCE_MM = 100.0
 
 # True이면 배치 후 안전 높이까지 후퇴한 다음 초기 관절 자세로 돌아간다.
 RETURN_TO_INITIAL_POSE_AFTER_PLACE = False

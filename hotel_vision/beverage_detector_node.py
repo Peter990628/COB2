@@ -1,3 +1,5 @@
+# beverage_detector_node
+# ros2 run hotel_vision beverage_detector_node --ros-args -p target_beverage:=cola
 import time
 from pathlib import Path
 from typing import Optional, Tuple
