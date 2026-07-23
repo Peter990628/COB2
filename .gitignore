@@ -10,4 +10,4 @@ install/
 log/
 .catkin_tools/
 
-.vscode
+.vscode/
