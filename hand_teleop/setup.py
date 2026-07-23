@@ -45,6 +45,10 @@ setup(
                 'hand_tracker_node_ver_depth = '
                 'hand_teleop.hand_tracker_node_ver_depth:main'
             ),
+            (
+                'hand_follow_robot_node_ver_depth = '
+                'hand_teleop.hand_follow_robot_node_ver_depth:main'
+            ),
         ],
     },
 )

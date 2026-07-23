@@ -37,6 +37,7 @@ MediaPipe 랜드마크의 자체 z도 카메라까지의 절대 거리가 아니
 즉, 손이 카메라 쪽으로 가까워져 hand_z가 양수가 되면 로봇은 BASE -X 쪽으로
 이동합니다. 반드시 로봇 X 최소/최대 범위로 한 번 더 제한해야 합니다.
 """
+# hand_tracker_node_ver_depth
 
 from __future__ import annotations
 
