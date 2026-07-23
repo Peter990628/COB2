@@ -30,6 +30,7 @@ MediaPipe Tasks API는 별도의 ``hand_landmarker.task`` 모델 파일을 필�
 """
 
 # export PYTHONNOUSERSITE=1 하기 실행할 때
+# hand_tracker_node
 
 from __future__ import annotations
 
@@ -175,8 +176,12 @@ def estimate_fist(
 class HandTrackerNode(Node):
     """웹캠 영상을 처리하고 손 상태 토픽을 발행하는 ROS 2 노드입니다."""
 
-    def __init__(self) -> None:
-        super().__init__("hand_tracker_node")
+    def __init__(self, node_name: str = "hand_tracker_node") -> None:
+        # 깊이 추정 버전이 카메라·MediaPipe·필터 구현을 그대로 재사용할 수
+        # 있도록 노드 이름만 선택적으로 받을 수 있게 합니다. 기본값은 기존과
+        # 같으므로 hand_tracker_node의 동작에는 변화가 없습니다.
+        super().__init__(node_name)
+        self._position_frame_id = "webcam_normalized"
 
         # ------------------------------------------------------------------
         # ROS 파라미터 선언
@@ -272,7 +277,7 @@ class HandTrackerNode(Node):
             raise ValueError("주먹 확인 프레임 수는 1 이상이어야 합니다.")
 
         # ------------------------------------------------------------------
-        # ROS Publisher 생성
+        # ROS Publisher 생성@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@
         # ------------------------------------------------------------------
         position_topic = str(self.get_parameter("position_topic").value)
         detected_topic = str(self.get_parameter("detected_topic").value)
@@ -485,6 +490,7 @@ class HandTrackerNode(Node):
         detected: bool,
         center: Optional[NormalizedPoint],
         fist: bool,
+        position_z: float = 0.0,
     ) -> None:
         """한 프레임의 손 상태를 ROS 토픽으로 발행합니다."""
 
@@ -499,10 +505,10 @@ class HandTrackerNode(Node):
 
         message = PointStamped()
         message.header.stamp = self.get_clock().now().to_msg()
-        message.header.frame_id = "webcam_normalized"
+        message.header.frame_id = self._position_frame_id
         message.point.x = float(center[0])
         message.point.y = float(center[1])
-        message.point.z = 0.0
+        message.point.z = float(position_z)
         self._position_publisher.publish(message)
 
     def _handle_no_hand(self) -> None:
@@ -609,6 +615,7 @@ class HandTrackerNode(Node):
         stable_fist: bool,
         folded_count: int,
         handedness_text: str,
+        published_z: Optional[float] = None,
     ) -> None:
         """손 랜드마크와 현재 판정 상태를 OpenCV 창에 표시합니다."""
 
@@ -708,9 +715,15 @@ class HandTrackerNode(Node):
         )
 
         if filtered_center is not None:
+            position_text = (
+                f"published x={filtered_center[0]:.3f}, "
+                f"y={filtered_center[1]:.3f}"
+            )
+            if published_z is not None:
+                position_text += f", z={published_z:+.3f}"
             cv2.putText(
                 frame,
-                f"published x={filtered_center[0]:.3f}, y={filtered_center[1]:.3f}",
+                position_text,
                 (15, 112),
                 cv2.FONT_HERSHEY_SIMPLEX,
                 0.65,

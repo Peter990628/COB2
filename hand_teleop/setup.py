@@ -41,6 +41,10 @@ setup(
     entry_points={
         'console_scripts': [
             'hand_tracker_node = hand_teleop.hand_tracker_node:main',
+            (
+                'hand_tracker_node_ver_depth = '
+                'hand_teleop.hand_tracker_node_ver_depth:main'
+            ),
         ],
     },
 )
