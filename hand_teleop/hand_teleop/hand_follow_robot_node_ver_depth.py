@@ -18,7 +18,7 @@
 ``/hand_teleop/fist``는 ``hand_tracker_node_ver_depth``에서 이미 여러 프레임
 확인된 안정화 상태입니다.
 
-* 손을 펴면 RG2를 80.0 mm, 3.0 N으로 엽니다.
+* 손을 펴면 RG2를 80.0 mm, 30.0 N으로 엽니다.
 * 주먹을 쥐면 RG2를 2.0 mm, 30.0 N으로 닫습니다.
 * 같은 상태가 유지되는 동안에는 같은 Modbus 명령을 반복하지 않습니다.
 * 손을 잃으면 물체를 떨어뜨리지 않도록 마지막 그리퍼 상태를 유지합니다.
@@ -42,7 +42,9 @@ X는 중립 위치에서 전진 거리 0 mm이고, 손을 카메라 쪽으로 �
 * 기본값은 ``dry_run=True``이므로 로봇을 움직이지 않습니다.
 * 실제 목표는 매번 초기 TCP pose로부터 계산해 상대 명령의 누적 오차를 막습니다.
 * 입력 범위, TCP 오프셋 범위, 한 주기 이동량, 속도와 가속도를 제한합니다.
-* 손 유실, 깊이 무효 또는 토픽 타임아웃 시 soft stop을 요청합니다.
+* 손 유실, 깊이 무효 또는 토픽 타임아웃 시 속도 0 명령으로 감속한 뒤
+  잠시 정지하고 저속으로 초기 관절 자세에 복귀합니다.
+* 로봇/그리퍼 fault와 노드 종료에는 자동 홈 복귀 대신 soft stop을 사용합니다.
 * RG2 통신은 별도 스레드에서 실행해 로봇 ``servol`` 주기를 막지 않습니다.
 * 이 소프트웨어 제한은 로봇의 안전 설정이나 비상정지 장치를 대신하지 않습니다.
 
@@ -64,22 +66,32 @@ Dry run:
     ros2 run hand_teleop hand_follow_robot_node_ver_depth --ros-args \
       -p dry_run:=false \
       -p gripper.open_width_mm:=80.0 \
-      -p gripper.open_force_n:=3.0 \
+      -p gripper.open_force_n:=30.0 \
       -p gripper.closed_width_mm:=2.0 \
       -p gripper.closed_force_n:=30.0
 """
-
+# hand_follow_robot_node_ver_depth
 from __future__ import annotations
 
+from enum import Enum
 import math
 import threading
 import time
 from typing import Callable, List, Optional, Sequence, Tuple
 
 import rclpy
-from dsr_msgs2.srv import MoveStop
+from dsr_msgs2.msg import SpeedlStream
+from dsr_msgs2.srv import (
+    CheckMotion,
+    GetCurrentPosx,
+    GetCurrentPosj,
+    GetCurrentVelx,
+    MoveJoint,
+    MoveStop,
+)
 from geometry_msgs.msg import PointStamped
 from rclpy.node import Node
+from rclpy.task import Future
 from std_msgs.msg import Bool
 
 import DR_init
@@ -95,6 +107,31 @@ DR_init.__dsr__model = ROBOT_MODEL
 
 Pose6 = List[float]
 HandPosition = Tuple[float, float, float]
+
+
+class FollowState(Enum):
+    """손 추종과 자동 홈 복귀 과정에서 노드가 가질 수 있는 상태."""
+
+    # 노드 시작 직후 또는 홈 복귀 완료 후 유효한 손 입력을 기다리는 상태입니다.
+    WAITING_FOR_HAND = "waiting_for_hand"
+
+    # 유효한 손 좌표를 servol 목표로 보내는 정상 추종 상태입니다.
+    TRACKING = "tracking"
+
+    # 손 입력을 잃어 speedl(0)으로 감속하고 실제 속도 0을 확인하는 상태입니다.
+    DECELERATING = "decelerating"
+
+    # 정지한 현재 위치를 유지하면서 홈 복귀 전 대기하는 상태입니다.
+    HOLDING = "holding"
+
+    # 유예 시간 안에 손이 돌아와 실제 TCP를 다시 읽는 상태입니다.
+    RESUMING_TRACKING = "resuming_tracking"
+
+    # 비동기 MoveJoint 서비스로 initial_joint_pose에 복귀 중인 상태입니다.
+    RETURNING_HOME = "returning_home"
+
+    # 로봇 또는 그리퍼 fault가 발생해 자동 동작을 금지한 상태입니다.
+    FAULT = "fault"
 
 
 def clamp(value: float, minimum: float, maximum: float) -> float:
@@ -131,16 +168,28 @@ def limit_linear_step(
     desired_pose: Sequence[float],
     maximum_step_mm: float,
 ) -> Pose6:
-    """X/Y/Z의 한 주기 이동량을 제한하고 원하는 A/B/C는 유지합니다."""
+    """XYZ 전체 이동거리를 제한하고 원하는 A/B/C는 그대로 유지합니다."""
 
     result = [float(value) for value in desired_pose]
-    for axis in range(3):
-        delta = float(desired_pose[axis]) - float(previous_pose[axis])
-        result[axis] = float(previous_pose[axis]) + clamp(
-            delta,
-            -maximum_step_mm,
-            maximum_step_mm,
-        )
+    linear_delta = [
+        float(desired_pose[axis]) - float(previous_pose[axis])
+        for axis in range(3)
+    ]
+    linear_distance = math.sqrt(
+        sum(delta * delta for delta in linear_delta)
+    )
+
+    # 기존 축별 제한은 X/Y/Z가 동시에 변할 때 대각선 이동거리가
+    # maximum_step_mm보다 커질 수 있었습니다. 전체 XYZ 벡터의 길이를
+    # 기준으로 같은 비율을 곱하면 이동 방향은 유지하면서 실제 TCP
+    # 이동거리만 maximum_step_mm 이하로 제한할 수 있습니다.
+    if linear_distance > maximum_step_mm:
+        scale = maximum_step_mm / linear_distance
+        for axis, delta in enumerate(linear_delta):
+            result[axis] = (
+                float(previous_pose[axis]) + delta * scale
+            )
+
     return result
 
 
@@ -209,8 +258,11 @@ class HandFollowRobotNodeVerDepth(Node):
         # 이 시간 동안 새 위치 토픽이 없으면 손 추종을 감속 정지합니다.
         self.declare_parameter("hand_timeout_sec", 0.30)
 
-        # 한 제어 주기에 명령 위치가 축별로 변할 수 있는 최대값 [mm]입니다.
-        self.declare_parameter("maximum_step_mm", 5.0)
+        # 한 제어 주기의 XYZ 벡터 전체 이동거리 제한 [mm]입니다.
+        # 직선·대각선 어느 방향에서도 실제 TCP 이동거리가 이 값을
+        # 넘지 않습니다. 10 Hz, 1.0 mm이면 명령 이동 속도 상한은
+        # 약 10 mm/s입니다.
+        self.declare_parameter("maximum_step_mm", 1.0)
 
         # servol의 최대 TCP 선속도 [mm/s]와 회전속도 [deg/s]입니다.
         self.declare_parameter("servo_linear_velocity", 30.0)
@@ -225,6 +277,73 @@ class HandFollowRobotNodeVerDepth(Node):
 
         # 추종 상태 로그가 너무 많이 출력되지 않도록 하는 간격입니다.
         self.declare_parameter("status_log_period_sec", 1.0)
+
+        # ------------------------------------------------------------------
+        # 손 추적 유실 시 감속·정지·자동 홈 복귀 설정
+        # ------------------------------------------------------------------
+        # 손이 이 시간 안에 다시 유효해지면 홈으로 가지 않고 추종을
+        # 재개합니다. 단, 유실 순간부터 speedl(0) 감속은 바로 시작합니다.
+        self.declare_parameter("recovery.loss_grace_sec", 0.5)
+
+        # 실제 TCP 속도가 0에 가까워진 뒤 현재 자리에서 더 기다릴 시간입니다.
+        self.declare_parameter("recovery.hold_before_home_sec", 1.0)
+
+        # speedl(0)의 감속 한계입니다. 첫 값은 선가속도 [mm/s²],
+        # 두 번째 값은 회전가속도 [deg/s²]입니다.
+        self.declare_parameter(
+            "recovery.stop_linear_acceleration", 30.0
+        )
+        self.declare_parameter(
+            "recovery.stop_rotational_acceleration", 20.0
+        )
+
+        # 현재 TCP 속도가 아래 값 이하인 상태가 연속된 횟수만큼 확인되면
+        # 정지 완료로 판정합니다.
+        self.declare_parameter(
+            "recovery.linear_stop_threshold_mm_s", 1.0
+        )
+        self.declare_parameter(
+            "recovery.rotational_stop_threshold_deg_s", 1.0
+        )
+        self.declare_parameter("recovery.stable_velocity_samples", 3)
+
+        # get_current_velx 서비스의 호출 간격과 한 응답의 제한시간입니다.
+        self.declare_parameter(
+            "recovery.velocity_check_period_sec", 0.10
+        )
+        self.declare_parameter(
+            "recovery.velocity_response_timeout_sec", 0.50
+        )
+
+        # 속도 0 명령 후에도 이 시간 안에 실제 정지가 확인되지 않으면
+        # 정상 복귀를 계속하지 않고 fault의 DR_SSTOP으로 전환합니다.
+        self.declare_parameter(
+            "recovery.deceleration_timeout_sec", 5.0
+        )
+
+        # 초기 관절 자세로 돌아갈 때만 사용하는 저속 movej 설정입니다.
+        # 시작 시 initial_joint_velocity/acceleration과 별개입니다.
+        self.declare_parameter("recovery.home_velocity", 5.0)
+        self.declare_parameter("recovery.home_acceleration", 10.0)
+
+        # 비동기 홈 모션 상태 확인 주기, 서비스 한 번의 응답 제한시간,
+        # 최종 관절각 허용 오차입니다.
+        self.declare_parameter(
+            "recovery.home_monitor_period_sec", 0.10
+        )
+        self.declare_parameter(
+            "recovery.home_service_response_timeout_sec", 0.50
+        )
+        self.declare_parameter(
+            "recovery.home_joint_tolerance_deg", 1.0
+        )
+
+        # 필요한 서비스가 나타날 때까지 기다리는 시간과 홈 movej 전체
+        # 완료 제한시간입니다. 초과하면 fault로 전환해 soft stop합니다.
+        self.declare_parameter(
+            "recovery.service_ready_timeout_sec", 2.0
+        )
+        self.declare_parameter("recovery.home_timeout_sec", 60.0)
 
         # ------------------------------------------------------------------
         # OnRobot RG2 설정
@@ -288,12 +407,46 @@ class HandFollowRobotNodeVerDepth(Node):
         self._last_fist_received_at: Optional[float] = None
 
         self._origin_pose: Optional[Pose6] = None
+        self._home_tcp_pose: Optional[Pose6] = None
         self._last_commanded_pose: Optional[Pose6] = None
         self._motion_active = False
         self._faulted = False
         self._last_block_reason: Optional[str] = None
         self._last_status_log_at = 0.0
         self._last_stop_warning_at = 0.0
+        self._last_stop_request_at = 0.0
+        self._stop_retry_period_sec = 0.5
+        self._stop_future: Optional[Future] = None
+
+        # 손 추종/복귀 상태 머신은 시작 시 유효한 손을 기다립니다.
+        self._follow_state = FollowState.WAITING_FOR_HAND
+        self._tracking_loss_started_at: Optional[float] = None
+        self._holding_started_at: Optional[float] = None
+        self._resume_after_stop_requested = False
+
+        # 감속 중 get_current_velx를 비동기로 요청하고 결과를 저장합니다.
+        # ROS 타이머 콜백 안에서 spin_until_future_complete를 사용하면 현재
+        # executor와 충돌할 수 있으므로 Future 완료 여부만 다음 tick에 봅니다.
+        self._velocity_future: Optional[Future] = None
+        self._velocity_request_started_at: Optional[float] = None
+        self._last_velocity_request_at = 0.0
+        self._stable_velocity_sample_count = 0
+        self._resume_pose_future: Optional[Future] = None
+        self._resume_pose_request_started_at: Optional[float] = None
+
+        # 홈 복귀 MoveJoint 역시 call_async로 요청해 ROS 구독과 watchdog이
+        # 홈 이동 중에도 계속 처리되도록 합니다.
+        self._home_future: Optional[Future] = None
+        self._home_request_started_at: Optional[float] = None
+        self._home_future_started_at: Optional[float] = None
+        self._home_check_future: Optional[Future] = None
+        self._home_joint_future: Optional[Future] = None
+        self._home_pose_future: Optional[Future] = None
+        self._home_waiting_for_joint_sample = False
+        self._home_waiting_for_tcp_sample = False
+        self._last_home_monitor_request_at = 0.0
+        self._home_idle_mismatch_count = 0
+        self._service_wait_started_at: Optional[float] = None
 
         # 실제 모드에서 채워지는 DSR 함수 참조입니다.
         self._servol: Optional[Callable] = None
@@ -351,6 +504,38 @@ class HandFollowRobotNodeVerDepth(Node):
             "motion/move_stop",
         )
 
+        # 손 유실 시 현재 TCP 속도를 읽고 초기 관절 자세로 돌아가기 위한
+        # 비동기 서비스 클라이언트입니다.
+        self._current_velx_client = self.create_client(
+            GetCurrentVelx,
+            "aux_control/get_current_velx",
+        )
+        self._move_joint_client = self.create_client(
+            MoveJoint,
+            "motion/move_joint",
+        )
+        self._check_motion_client = self.create_client(
+            CheckMotion,
+            "motion/check_motion",
+        )
+        self._current_posj_client = self.create_client(
+            GetCurrentPosj,
+            "aux_control/get_current_posj",
+        )
+        self._current_posx_client = self.create_client(
+            GetCurrentPosx,
+            "aux_control/get_current_posx",
+        )
+
+        # DSR_ROBOT2.speedl()도 같은 토픽을 사용하지만, 여기서는 타이머
+        # 내부에서 완전히 비동기로 속도 0을 보내기 위해 직접 publisher를
+        # 생성합니다. 상대 이름이므로 실제 토픽은 /dsr01/speedl_stream입니다.
+        self._speedl_publisher = self.create_publisher(
+            SpeedlStream,
+            "speedl_stream",
+            10,
+        )
+
         try:
             if self._dry_run:
                 self.get_logger().warning(
@@ -391,6 +576,19 @@ class HandFollowRobotNodeVerDepth(Node):
             "현재 ±300 mm Y/Z 범위는 큰 시험 범위입니다. "
             "실제 장비에서는 주변 충돌과 네 모서리 도달 가능성을 먼저 "
             "확인하고 더 작은 값부터 시험하세요."
+        )
+        self.get_logger().info(
+            "손 유실 자동 복귀: "
+            f"grace={self._recovery_loss_grace_sec:.2f}s, "
+            f"hold={self._recovery_hold_before_home_sec:.2f}s, "
+            f"home vel={self._recovery_home_velocity:.1f}deg/s, "
+            f"home acc={self._recovery_home_acceleration:.1f}deg/s²"
+        )
+        self.get_logger().warning(
+            "자동 홈 복귀는 충돌 회피 계획이 아니라 현재 자세에서 "
+            "initial_joint_pose로 가는 관절 amovej입니다. 실제 장비에서는 "
+            "전체 복귀 궤적과 주변 여유 공간을 먼저 RViz·저속으로 "
+            "검증하세요."
         )
         if self._gripper_enabled:
             self.get_logger().info(
@@ -488,6 +686,87 @@ class HandFollowRobotNodeVerDepth(Node):
             self.get_parameter("status_log_period_sec").value
         )
 
+        # 손 추적 유실 후 정상 감속과 저속 홈 복귀에 사용하는 값입니다.
+        self._recovery_loss_grace_sec = float(
+            self.get_parameter("recovery.loss_grace_sec").value
+        )
+        self._recovery_hold_before_home_sec = float(
+            self.get_parameter(
+                "recovery.hold_before_home_sec"
+            ).value
+        )
+        self._recovery_stop_linear_acceleration = float(
+            self.get_parameter(
+                "recovery.stop_linear_acceleration"
+            ).value
+        )
+        self._recovery_stop_rotational_acceleration = float(
+            self.get_parameter(
+                "recovery.stop_rotational_acceleration"
+            ).value
+        )
+        self._recovery_linear_stop_threshold = float(
+            self.get_parameter(
+                "recovery.linear_stop_threshold_mm_s"
+            ).value
+        )
+        self._recovery_rotational_stop_threshold = float(
+            self.get_parameter(
+                "recovery.rotational_stop_threshold_deg_s"
+            ).value
+        )
+        self._recovery_stable_velocity_samples = int(
+            self.get_parameter(
+                "recovery.stable_velocity_samples"
+            ).value
+        )
+        self._recovery_velocity_check_period_sec = float(
+            self.get_parameter(
+                "recovery.velocity_check_period_sec"
+            ).value
+        )
+        self._recovery_velocity_response_timeout_sec = float(
+            self.get_parameter(
+                "recovery.velocity_response_timeout_sec"
+            ).value
+        )
+        self._recovery_deceleration_timeout_sec = float(
+            self.get_parameter(
+                "recovery.deceleration_timeout_sec"
+            ).value
+        )
+        self._recovery_home_velocity = float(
+            self.get_parameter("recovery.home_velocity").value
+        )
+        self._recovery_home_acceleration = float(
+            self.get_parameter(
+                "recovery.home_acceleration"
+            ).value
+        )
+        self._recovery_home_monitor_period_sec = float(
+            self.get_parameter(
+                "recovery.home_monitor_period_sec"
+            ).value
+        )
+        self._recovery_home_service_response_timeout_sec = float(
+            self.get_parameter(
+                "recovery.home_service_response_timeout_sec"
+            ).value
+        )
+        self._recovery_home_joint_tolerance_deg = float(
+            self.get_parameter(
+                "recovery.home_joint_tolerance_deg"
+            ).value
+        )
+        self._recovery_service_ready_timeout_sec = float(
+            self.get_parameter(
+                "recovery.service_ready_timeout_sec"
+            ).value
+        )
+        self._recovery_home_timeout_sec = float(
+            self.get_parameter("recovery.home_timeout_sec").value
+        )
+
         # RG2 사용 여부와 Modbus 연결 정보를 읽습니다.
         self._gripper_enabled = bool(
             self.get_parameter("gripper.enabled").value
@@ -554,6 +833,23 @@ class HandFollowRobotNodeVerDepth(Node):
                 self._servo_rotational_acceleration,
                 self._servo_reach_time_sec,
                 self._status_log_period_sec,
+                self._recovery_loss_grace_sec,
+                self._recovery_hold_before_home_sec,
+                self._recovery_stop_linear_acceleration,
+                self._recovery_stop_rotational_acceleration,
+                self._recovery_linear_stop_threshold,
+                self._recovery_rotational_stop_threshold,
+                float(self._recovery_stable_velocity_samples),
+                self._recovery_velocity_check_period_sec,
+                self._recovery_velocity_response_timeout_sec,
+                self._recovery_deceleration_timeout_sec,
+                self._recovery_home_velocity,
+                self._recovery_home_acceleration,
+                self._recovery_home_monitor_period_sec,
+                self._recovery_home_service_response_timeout_sec,
+                self._recovery_home_joint_tolerance_deg,
+                self._recovery_service_ready_timeout_sec,
+                self._recovery_home_timeout_sec,
                 float(self._gripper_port),
                 self._gripper_open_width_mm,
                 self._gripper_open_force_n,
@@ -600,6 +896,30 @@ class HandFollowRobotNodeVerDepth(Node):
             or self._status_log_period_sec <= 0.0
         ):
             raise ValueError("제어 주기·제한·속도·가속도는 0보다 커야 합니다.")
+
+        if (
+            self._recovery_loss_grace_sec < 0.0
+            or self._recovery_hold_before_home_sec < 0.0
+            or self._recovery_stop_linear_acceleration <= 0.0
+            or self._recovery_stop_rotational_acceleration <= 0.0
+            or self._recovery_linear_stop_threshold <= 0.0
+            or self._recovery_rotational_stop_threshold <= 0.0
+            or self._recovery_stable_velocity_samples < 1
+            or self._recovery_velocity_check_period_sec <= 0.0
+            or self._recovery_velocity_response_timeout_sec <= 0.0
+            or self._recovery_deceleration_timeout_sec <= 0.0
+            or self._recovery_home_velocity <= 0.0
+            or self._recovery_home_acceleration <= 0.0
+            or self._recovery_home_monitor_period_sec <= 0.0
+            or self._recovery_home_service_response_timeout_sec <= 0.0
+            or self._recovery_home_joint_tolerance_deg <= 0.0
+            or self._recovery_service_ready_timeout_sec <= 0.0
+            or self._recovery_home_timeout_sec <= 0.0
+        ):
+            raise ValueError(
+                "recovery의 grace/hold는 0 이상, 나머지 속도·가속도·"
+                "threshold·timeout 값은 0보다 커야 합니다."
+            )
 
         # RG2 공식 사양:
         #   폭 0~110 mm, 힘 3~40 N
@@ -911,6 +1231,17 @@ class HandFollowRobotNodeVerDepth(Node):
             )
 
         self._origin_pose = origin_pose
+        if self._move_to_initial_pose:
+            # 이 TCP pose는 initial_joint_pose에 실제 도착한 직후 측정한
+            # 값이므로 자동 홈 복귀 완료 후 추종 원점으로 다시 사용할 수
+            # 있습니다.
+            self._home_tcp_pose = origin_pose.copy()
+        else:
+            self.get_logger().warning(
+                "move_to_initial_pose=False이므로 자동 홈 복귀 후의 TCP "
+                "추종 원점을 미리 알 수 없습니다. 자동 복귀를 시작하기 "
+                "전에는 노드를 initial_joint_pose에서 실행하세요."
+            )
         self._last_commanded_pose = origin_pose.copy()
         self._servol = servol
         self._posx = posx
@@ -969,11 +1300,9 @@ class HandFollowRobotNodeVerDepth(Node):
         self._fist = bool(message.data)
         self._last_fist_received_at = time.monotonic()
 
-    def _tracking_block_reason(self, now: float) -> Optional[str]:
-        """현재 로봇 추종을 중단해야 하는 이유를 반환합니다."""
+    def _tracking_loss_reason(self, now: float) -> Optional[str]:
+        """손 추종 입력이 현재 유효하지 않은 이유를 반환합니다."""
 
-        if self._faulted:
-            return "로봇 제어 fault가 발생해 재시작이 필요합니다"
         if not self._hand_detected:
             return "손이 검출되지 않았습니다"
         if not self._depth_valid:
@@ -1051,41 +1380,858 @@ class HandFollowRobotNodeVerDepth(Node):
             self._origin_pose[5],
         ]
 
+    def _set_fault(self, message: str) -> None:
+        """복구할 수 없는 오류를 기록하고 자동 동작을 금지합니다."""
+
+        if not self._faulted:
+            self.get_logger().error(message)
+        self._cancel_recovery_futures()
+        self._faulted = True
+        self._follow_state = FollowState.FAULT
+        self._request_soft_stop(message)
+
+    def _cancel_recovery_futures(self) -> None:
+        """감속·홈 복귀 중 남은 비동기 요청을 모두 정리합니다."""
+
+        future_names = (
+            "_velocity_future",
+            "_resume_pose_future",
+            "_home_future",
+            "_home_check_future",
+            "_home_joint_future",
+            "_home_pose_future",
+        )
+        for future_name in future_names:
+            future = getattr(self, future_name, None)
+            if future is not None and not future.done():
+                future.cancel()
+            setattr(self, future_name, None)
+
+        self._velocity_request_started_at = None
+        self._resume_pose_request_started_at = None
+        self._home_future_started_at = None
+        self._resume_after_stop_requested = False
+        self._home_waiting_for_joint_sample = False
+        self._home_waiting_for_tcp_sample = False
+
+    @staticmethod
+    def _pose_from_get_current_posx_response(response) -> Pose6:
+        """GetCurrentPosx 응답에서 BASE TCP pose 여섯 값을 꺼냅니다."""
+
+        if response is None or not response.success:
+            raise RuntimeError("get_current_posx 응답이 실패했습니다.")
+        if len(response.task_pos_info) < 1:
+            raise RuntimeError(
+                "get_current_posx 응답에 task_pos_info가 없습니다."
+            )
+
+        pose_data = [
+            float(value)
+            for value in response.task_pos_info[0].data[:6]
+        ]
+        if len(pose_data) != 6 or not all(
+            math.isfinite(value) for value in pose_data
+        ):
+            raise RuntimeError(
+                f"get_current_posx의 TCP pose가 올바르지 않습니다: "
+                f"{pose_data}"
+            )
+        return pose_data
+
+    def _publish_zero_tcp_velocity(self) -> None:
+        """speedl 목표 속도 0을 보내 설정 가속도 안에서 감속시킵니다."""
+
+        if self._dry_run:
+            self.get_logger().info(
+                "DRY RUN: speedl([0, 0, 0, 0, 0, 0]) 감속 명령"
+            )
+            return
+
+        message = SpeedlStream()
+        message.vel = [0.0] * 6
+        message.acc = [
+            self._recovery_stop_linear_acceleration,
+            self._recovery_stop_rotational_acceleration,
+        ]
+        # time=0이면 지정한 최대 가속도를 기준으로 속도 0에 접근합니다.
+        message.time = 0.0
+        self._speedl_publisher.publish(message)
+        self._motion_active = True
+
+    def _begin_tracking_loss(
+        self,
+        now: float,
+        reason: str,
+    ) -> None:
+        """손 입력 유실을 기록하고 정상 감속 단계를 시작합니다."""
+
+        self._follow_state = FollowState.DECELERATING
+        self._tracking_loss_started_at = now
+        self._holding_started_at = None
+        self._resume_after_stop_requested = False
+        self._stable_velocity_sample_count = 0
+        self._last_velocity_request_at = 0.0
+        self._velocity_request_started_at = None
+        self._service_wait_started_at = None
+        if self._velocity_future is not None:
+            self._velocity_future.cancel()
+        self._velocity_future = None
+
+        self._last_block_reason = reason
+        self.get_logger().warning(
+            f"손 추종 입력 유실: {reason}. "
+            "DR_SSTOP 대신 speedl 목표 속도 0으로 감속합니다. "
+            f"{self._recovery_loss_grace_sec:.2f}초 안에 입력이 "
+            "회복되면 홈 복귀를 취소합니다."
+        )
+        self._publish_zero_tcp_velocity()
+
+    def _start_tracking_resume(self, now: float) -> None:
+        """정지 후 실제 TCP를 읽는 부드러운 추종 재개를 시작합니다."""
+
+        self._follow_state = FollowState.RESUMING_TRACKING
+        self._resume_pose_request_started_at = None
+        self._service_wait_started_at = None
+        if self._resume_pose_future is not None:
+            self._resume_pose_future.cancel()
+        self._resume_pose_future = None
+
+        if self._dry_run:
+            self._tracking_loss_started_at = None
+            self._holding_started_at = None
+            self._resume_after_stop_requested = False
+            self._follow_state = FollowState.TRACKING
+            self._last_block_reason = None
+            self.get_logger().info(
+                "DRY RUN: 유효한 손 입력이 돌아와 추종을 재개합니다."
+            )
+            self._send_tracking_command(now)
+            return
+
+        self.get_logger().info(
+            "유예 시간 안에 손 입력이 돌아왔습니다. 정지한 실제 BASE "
+            "TCP를 읽은 뒤 그 위치부터 부드럽게 추종을 재개합니다."
+        )
+
+    def _process_tracking_resume(
+        self,
+        now: float,
+        loss_reason: Optional[str],
+    ) -> None:
+        """실제 정지 TCP를 마지막 명령 pose로 설정한 뒤 추종을 재개합니다."""
+
+        # pose 조회 중 손을 다시 잃으면 재개를 취소하고 정지 유지 상태로
+        # 돌아갑니다. 이때 로봇은 이미 실제 속도 0이 확인된 상태입니다.
+        if loss_reason is not None:
+            if (
+                self._resume_pose_future is not None
+                and not self._resume_pose_future.done()
+            ):
+                self._resume_pose_future.cancel()
+            self._resume_pose_future = None
+            self._resume_pose_request_started_at = None
+            self._resume_after_stop_requested = False
+            self._service_wait_started_at = None
+            self._follow_state = FollowState.HOLDING
+            if self._holding_started_at is None:
+                self._holding_started_at = now
+            self.get_logger().warning(
+                f"추종 재개 중 입력을 다시 잃어 홈 복귀를 계속합니다: "
+                f"{loss_reason}"
+            )
+            return
+
+        future = self._resume_pose_future
+        if future is not None:
+            request_started_at = self._resume_pose_request_started_at
+            if not future.done():
+                if request_started_at is None:
+                    self._set_fault(
+                        "추종 재개 TCP pose 요청 시각이 없습니다."
+                    )
+                elif (
+                    now - request_started_at
+                    > self._recovery_home_service_response_timeout_sec
+                ):
+                    self._set_fault(
+                        "추종 재개용 get_current_posx 응답 시간이 "
+                        "초과됐습니다."
+                    )
+                return
+
+            self._resume_pose_future = None
+            self._resume_pose_request_started_at = None
+            try:
+                actual_pose = self._pose_from_get_current_posx_response(
+                    future.result()
+                )
+            except Exception as error:
+                self._set_fault(
+                    f"추종 재개용 현재 TCP pose 조회 오류: {error}"
+                )
+                return
+
+            # 원점은 initial_joint_pose의 TCP에 그대로 두고, 한 주기
+            # maximum_step_mm 제한의 시작점만 실제 정지 TCP로 맞춥니다.
+            self._last_commanded_pose = actual_pose
+            self._tracking_loss_started_at = None
+            self._holding_started_at = None
+            self._resume_after_stop_requested = False
+            self._service_wait_started_at = None
+            self._follow_state = FollowState.TRACKING
+            self._last_block_reason = None
+            self.get_logger().info(
+                "실제 정지 TCP를 기준으로 손 추종을 재개합니다: "
+                f"{[round(value, 3) for value in actual_pose]}"
+            )
+            self._send_tracking_command(now)
+            return
+
+        if not self._current_posx_client.service_is_ready():
+            if self._service_wait_started_at is None:
+                self._service_wait_started_at = now
+                self.get_logger().warning(
+                    "추종 재개를 위해 aux_control/get_current_posx "
+                    "서비스를 기다립니다."
+                )
+            elif (
+                now - self._service_wait_started_at
+                > self._recovery_service_ready_timeout_sec
+            ):
+                self._set_fault(
+                    "get_current_posx 서비스를 사용할 수 없어 안전하게 "
+                    "손 추종을 재개하지 못했습니다."
+                )
+            return
+
+        self._service_wait_started_at = None
+        request = GetCurrentPosx.Request()
+        request.ref = 0  # DR_BASE
+        self._resume_pose_future = (
+            self._current_posx_client.call_async(request)
+        )
+        self._resume_pose_request_started_at = now
+
+    def _mark_deceleration_complete(self, now: float) -> None:
+        """TCP 정지 확인 후 현재 위치 유지 상태로 전환합니다."""
+
+        self._velocity_future = None
+        self._velocity_request_started_at = None
+        self._service_wait_started_at = None
+        self._stable_velocity_sample_count = 0
+        self._holding_started_at = now
+        self._follow_state = FollowState.HOLDING
+        self._motion_active = False
+
+        self.get_logger().info(
+            "TCP 속도가 0에 가까워졌습니다. 현재 위치를 유지하며 "
+            f"{self._recovery_hold_before_home_sec:.2f}초 대기합니다."
+        )
+
+    def _process_deceleration(self, now: float) -> None:
+        """비동기 TCP 속도 조회 결과로 감속 완료 여부를 확인합니다."""
+
+        if self._dry_run:
+            self._mark_deceleration_complete(now)
+            return
+
+        loss_started_at = self._tracking_loss_started_at
+        if loss_started_at is None:
+            self._set_fault(
+                "감속 상태인데 손 유실 시작 시간이 없습니다."
+            )
+            return
+        if (
+            now - loss_started_at
+            > self._recovery_deceleration_timeout_sec
+        ):
+            self._set_fault(
+                "speedl 목표 속도 0을 보낸 뒤 제한시간 안에 실제 "
+                "정지가 확인되지 않아 DR_SSTOP으로 전환합니다."
+            )
+            return
+
+        future = self._velocity_future
+        if future is not None:
+            request_started_at = self._velocity_request_started_at
+            if not future.done():
+                if request_started_at is None:
+                    self._set_fault(
+                        "get_current_velx 요청 시각이 저장되지 않았습니다."
+                    )
+                elif (
+                    now - request_started_at
+                    > self._recovery_velocity_response_timeout_sec
+                ):
+                    self._set_fault(
+                        "get_current_velx 응답 시간이 초과되어 자동 홈 "
+                        "복귀를 중단합니다."
+                    )
+                return
+
+            self._velocity_future = None
+            self._velocity_request_started_at = None
+            try:
+                response = future.result()
+            except Exception as error:
+                self._set_fault(
+                    f"get_current_velx 서비스 오류: {error}"
+                )
+                return
+
+            if (
+                response is None
+                or not response.success
+                or len(response.vel) != 6
+            ):
+                self._set_fault(
+                    "get_current_velx가 올바른 속도를 반환하지 않았습니다."
+                )
+                return
+
+            velocity = [float(value) for value in response.vel]
+            if not all(math.isfinite(value) for value in velocity):
+                self._set_fault(
+                    f"유효하지 않은 TCP 속도를 받았습니다: {velocity}"
+                )
+                return
+
+            linear_speed = math.sqrt(
+                sum(component * component for component in velocity[:3])
+            )
+            rotational_speed = math.sqrt(
+                sum(component * component for component in velocity[3:])
+            )
+            stopped = (
+                linear_speed <= self._recovery_linear_stop_threshold
+                and rotational_speed
+                <= self._recovery_rotational_stop_threshold
+            )
+            if stopped:
+                self._stable_velocity_sample_count += 1
+            else:
+                self._stable_velocity_sample_count = 0
+
+            if (
+                self._stable_velocity_sample_count
+                >= self._recovery_stable_velocity_samples
+            ):
+                self._mark_deceleration_complete(now)
+            return
+
+        if (
+            now - self._last_velocity_request_at
+            < self._recovery_velocity_check_period_sec
+        ):
+            return
+
+        if not self._current_velx_client.service_is_ready():
+            if self._service_wait_started_at is None:
+                self._service_wait_started_at = now
+                self.get_logger().warning(
+                    "aux_control/get_current_velx 서비스를 기다립니다."
+                )
+            elif (
+                now - self._service_wait_started_at
+                > self._recovery_service_ready_timeout_sec
+            ):
+                self._set_fault(
+                    "get_current_velx 서비스를 사용할 수 없어 자동 홈 "
+                    "복귀를 중단합니다."
+                )
+            return
+
+        self._service_wait_started_at = None
+        request = GetCurrentVelx.Request()
+        request.ref = 0  # DR_BASE
+        self._velocity_future = self._current_velx_client.call_async(
+            request
+        )
+        self._velocity_request_started_at = now
+        self._last_velocity_request_at = now
+
+    def _start_home_return(self, now: float) -> None:
+        """저속 절대 MoveJoint 요청으로 initial_joint_pose 복귀를 시작합니다."""
+
+        if self._dry_run:
+            self.get_logger().info(
+                "DRY RUN: initial_joint_pose 저속 복귀를 완료한 것으로 "
+                "처리하고 새 손 입력을 기다립니다."
+            )
+            self._complete_home_return()
+            return
+
+        if self._home_tcp_pose is None:
+            self._set_fault(
+                "initial_joint_pose의 TCP 원점이 저장되지 않아 안전하게 "
+                "홈 복귀 후 추종을 재개할 수 없습니다. "
+                "move_to_initial_pose=True로 노드를 다시 시작하세요."
+            )
+            return
+
+        if not self._move_joint_client.service_is_ready():
+            if self._service_wait_started_at is None:
+                self._service_wait_started_at = now
+                self.get_logger().warning(
+                    "motion/move_joint 서비스를 기다립니다."
+                )
+            elif (
+                now - self._service_wait_started_at
+                > self._recovery_service_ready_timeout_sec
+            ):
+                self._set_fault(
+                    "motion/move_joint 서비스를 사용할 수 없어 자동 홈 "
+                    "복귀를 중단합니다."
+                )
+            return
+
+        self._service_wait_started_at = None
+        request = MoveJoint.Request()
+        request.pos = self._initial_joint_pose
+        request.vel = self._recovery_home_velocity
+        request.acc = self._recovery_home_acceleration
+        request.time = 0.0
+        request.radius = 0.0
+        request.mode = 0       # DR_MV_MOD_ABS: 절대 관절각
+        request.blend_type = 0
+        # sync_type=1은 amovej입니다. 서비스 콜백이 로봇이 홈에 도착할
+        # 때까지 막히지 않으므로, 같은 dsr_controller2의 check_motion과
+        # move_stop 서비스도 홈 이동 중 계속 사용할 수 있습니다.
+        request.sync_type = 1
+
+        self._home_future = self._move_joint_client.call_async(request)
+        self._home_request_started_at = now
+        self._home_future_started_at = now
+        self._home_check_future = None
+        self._home_joint_future = None
+        self._home_pose_future = None
+        self._home_waiting_for_joint_sample = False
+        self._home_waiting_for_tcp_sample = False
+        self._last_home_monitor_request_at = 0.0
+        self._home_idle_mismatch_count = 0
+        self._resume_after_stop_requested = False
+        self._follow_state = FollowState.RETURNING_HOME
+        self._motion_active = True
+
+        self.get_logger().warning(
+            "손 입력이 계속 유실되어 initial_joint_pose로 저속 복귀합니다: "
+            f"joint={self._initial_joint_pose}, "
+            f"vel={self._recovery_home_velocity:.1f}deg/s, "
+            f"acc={self._recovery_home_acceleration:.1f}deg/s². "
+            "복귀 중 손 명령은 무시합니다."
+        )
+
+    def _complete_home_return(
+        self,
+        actual_home_pose: Optional[Pose6] = None,
+    ) -> None:
+        """홈 복귀 완료 상태를 정리하고 새 위치 토픽을 기다립니다."""
+
+        if actual_home_pose is not None:
+            # 최종 관절각 허용 오차 때문에 캐시된 TCP와 실제 TCP 사이에
+            # 작은 차이가 생길 수 있습니다. 실제 측정 pose를 다음 추종의
+            # 원점과 maximum_step_mm 시작점으로 사용해 첫 명령의 점프를
+            # 막습니다.
+            self._home_tcp_pose = actual_home_pose.copy()
+
+        if self._home_tcp_pose is not None:
+            self._origin_pose = self._home_tcp_pose.copy()
+            self._last_commanded_pose = self._home_tcp_pose.copy()
+
+        # 홈 이동 중 수신된 오래된 손 위치로 즉시 움직이지 않도록, 완료
+        # 이후 들어오는 새 PointStamped를 한 번 더 기다립니다.
+        self._latest_hand_position = None
+        self._last_position_received_at = None
+
+        self._home_future = None
+        self._home_request_started_at = None
+        self._home_future_started_at = None
+        self._home_check_future = None
+        self._home_joint_future = None
+        self._home_pose_future = None
+        self._home_waiting_for_joint_sample = False
+        self._home_waiting_for_tcp_sample = False
+        self._last_home_monitor_request_at = 0.0
+        self._home_idle_mismatch_count = 0
+        self._tracking_loss_started_at = None
+        self._holding_started_at = None
+        self._resume_after_stop_requested = False
+        self._service_wait_started_at = None
+        self._follow_state = FollowState.WAITING_FOR_HAND
+        self._motion_active = False
+        self._last_block_reason = None
+
+        self.get_logger().info(
+            "initial_joint_pose 복귀를 완료했습니다. "
+            "새로운 유효한 손 위치를 기다립니다."
+        )
+
+    def _process_home_return(self, now: float) -> None:
+        """amovej 수락·모션 상태·최종 관절각을 순서대로 확인합니다."""
+
+        home_started_at = self._home_request_started_at
+        if home_started_at is None:
+            self._set_fault(
+                "홈 복귀 상태인데 전체 제한시간의 기준 시각이 없습니다."
+            )
+            return
+        if now - home_started_at > self._recovery_home_timeout_sec:
+            self._set_fault(
+                "initial_joint_pose 홈 복귀 시간이 초과됐습니다."
+            )
+            return
+
+        # 1) 처음 보낸 amovej 서비스가 명령을 수락했는지 확인합니다.
+        command_future = self._home_future
+        if command_future is not None:
+            future_started_at = self._home_future_started_at
+            if not command_future.done():
+                if future_started_at is None:
+                    self._set_fault(
+                        "홈 amovej 요청 시각이 저장되지 않았습니다."
+                    )
+                elif (
+                    now - future_started_at
+                    > self._recovery_home_service_response_timeout_sec
+                ):
+                    self._set_fault(
+                        "initial_joint_pose amovej 명령 응답 시간이 "
+                        "초과됐습니다."
+                    )
+                return
+
+            self._home_future = None
+            self._home_future_started_at = None
+            try:
+                response = command_future.result()
+            except Exception as error:
+                self._set_fault(
+                    f"홈 amovej 서비스 오류: {error}"
+                )
+                return
+            if response is None or not response.success:
+                self._set_fault(
+                    "initial_joint_pose 홈 amovej 명령이 거부됐습니다."
+                )
+                return
+
+            self.get_logger().info(
+                "initial_joint_pose amovej 명령이 수락됐습니다. "
+                "check_motion으로 완료 여부를 확인합니다."
+            )
+            return
+
+        # 2) 관절각 도착을 확인한 뒤 요청한 실제 BASE TCP pose를
+        # 처리합니다. 캐시된 초기 TCP 대신 이 값을 다음 추종 원점으로
+        # 사용하면 홈 도착 허용 오차로 인한 첫 servol 점프를 막을 수 있습니다.
+        pose_future = self._home_pose_future
+        if pose_future is not None:
+            future_started_at = self._home_future_started_at
+            if not pose_future.done():
+                if future_started_at is None:
+                    self._set_fault(
+                        "홈 복귀 최종 TCP pose 조회 시각이 없습니다."
+                    )
+                elif (
+                    now - future_started_at
+                    > self._recovery_home_service_response_timeout_sec
+                ):
+                    self._set_fault(
+                        "홈 복귀 최종 TCP pose 조회 응답 시간이 "
+                        "초과됐습니다."
+                    )
+                return
+
+            self._home_pose_future = None
+            self._home_future_started_at = None
+            try:
+                actual_home_pose = (
+                    self._pose_from_get_current_posx_response(
+                        pose_future.result()
+                    )
+                )
+            except Exception as error:
+                self._set_fault(
+                    f"홈 복귀 최종 TCP pose 조회 오류: {error}"
+                )
+                return
+
+            self._complete_home_return(actual_home_pose)
+            return
+
+        # 3) check_motion이 IDLE을 반환한 뒤 요청한 실제 관절각을
+        # 확인합니다. 상태만 IDLE인 순간적인 경합을 완료로 오인하지 않도록
+        # 목표 관절각과의 차이도 함께 검사합니다.
+        joint_future = self._home_joint_future
+        if joint_future is not None:
+            future_started_at = self._home_future_started_at
+            if not joint_future.done():
+                if future_started_at is None:
+                    self._set_fault(
+                        "홈 복귀 관절각 조회 시각이 저장되지 않았습니다."
+                    )
+                elif (
+                    now - future_started_at
+                    > self._recovery_home_service_response_timeout_sec
+                ):
+                    self._set_fault(
+                        "홈 복귀 최종 관절각 조회 응답 시간이 "
+                        "초과됐습니다."
+                    )
+                return
+
+            self._home_joint_future = None
+            self._home_future_started_at = None
+            try:
+                response = joint_future.result()
+            except Exception as error:
+                self._set_fault(
+                    f"홈 복귀 최종 관절각 조회 오류: {error}"
+                )
+                return
+            if (
+                response is None
+                or not response.success
+                or len(response.pos) != 6
+            ):
+                self._set_fault(
+                    "홈 복귀 후 올바른 현재 관절각을 읽지 못했습니다."
+                )
+                return
+
+            actual_joint = [float(value) for value in response.pos]
+            if not all(math.isfinite(value) for value in actual_joint):
+                self._set_fault(
+                    "홈 복귀 후 유효하지 않은 관절각을 받았습니다: "
+                    f"{actual_joint}"
+                )
+                return
+
+            # -180/180도 경계를 지나는 같은 각도를 큰 오차로 계산하지
+            # 않도록 각 관절의 차이를 [-180, 180) 범위로 감쌉니다.
+            joint_errors = [
+                abs(
+                    (actual - target + 180.0) % 360.0 - 180.0
+                )
+                for actual, target in zip(
+                    actual_joint,
+                    self._initial_joint_pose,
+                )
+            ]
+            maximum_error = max(joint_errors)
+            if maximum_error <= self._recovery_home_joint_tolerance_deg:
+                self._home_waiting_for_tcp_sample = True
+                return
+
+            # amovej 직후 check_motion이 잠깐 IDLE로 보이는 경합일 수도
+            # 있으므로 즉시 fault로 만들지 않고 전체 home_timeout 동안 다시
+            # 확인합니다. 반복 경고는 10회마다만 출력합니다.
+            self._home_idle_mismatch_count += 1
+            if (
+                self._home_idle_mismatch_count == 1
+                or self._home_idle_mismatch_count % 10 == 0
+            ):
+                self.get_logger().warning(
+                    "check_motion은 IDLE이지만 아직 initial_joint_pose "
+                    "허용 오차 안이 아닙니다: "
+                    f"max_error={maximum_error:.3f}deg, "
+                    f"actual={[round(value, 3) for value in actual_joint]}"
+                )
+            self._last_home_monitor_request_at = now
+            return
+
+        # 4) 진행 중인 check_motion 요청 결과를 처리합니다.
+        check_future = self._home_check_future
+        if check_future is not None:
+            future_started_at = self._home_future_started_at
+            if not check_future.done():
+                if future_started_at is None:
+                    self._set_fault(
+                        "홈 복귀 상태 조회 시각이 저장되지 않았습니다."
+                    )
+                elif (
+                    now - future_started_at
+                    > self._recovery_home_service_response_timeout_sec
+                ):
+                    self._set_fault(
+                        "홈 복귀 check_motion 응답 시간이 초과됐습니다."
+                    )
+                return
+
+            self._home_check_future = None
+            self._home_future_started_at = None
+            try:
+                response = check_future.result()
+            except Exception as error:
+                self._set_fault(
+                    f"홈 복귀 check_motion 서비스 오류: {error}"
+                )
+                return
+            if response is None or not response.success:
+                self._set_fault(
+                    "홈 복귀 check_motion 상태 조회가 실패했습니다."
+                )
+                return
+
+            motion_status = int(response.status)
+            if motion_status == 0:  # DR_STATE_IDLE
+                self._home_waiting_for_joint_sample = True
+            elif 1 <= motion_status <= 6:
+                # DR_STATE_INIT/BUSY/BLEND/ACC/CRZ/DEC:
+                # 아직 진행 중이므로 다음 monitor 주기에 다시 확인합니다.
+                pass
+            else:
+                self._set_fault(
+                    "check_motion이 알 수 없는 상태를 반환했습니다: "
+                    f"{motion_status}"
+                )
+            return
+
+        # 5) 관절 목표 도착 확인 후 실제 BASE TCP pose를 요청합니다.
+        if self._home_waiting_for_tcp_sample:
+            if not self._current_posx_client.service_is_ready():
+                if self._service_wait_started_at is None:
+                    self._service_wait_started_at = now
+                    self.get_logger().warning(
+                        "홈 복귀 완료 pose를 위해 "
+                        "aux_control/get_current_posx 서비스를 기다립니다."
+                    )
+                elif (
+                    now - self._service_wait_started_at
+                    > self._recovery_service_ready_timeout_sec
+                ):
+                    self._set_fault(
+                        "get_current_posx 서비스를 사용할 수 없어 홈 "
+                        "복귀 완료 pose를 확인하지 못했습니다."
+                    )
+                return
+
+            self._service_wait_started_at = None
+            self._home_waiting_for_tcp_sample = False
+            request = GetCurrentPosx.Request()
+            request.ref = 0  # DR_BASE
+            self._home_pose_future = (
+                self._current_posx_client.call_async(request)
+            )
+            self._home_future_started_at = now
+            return
+
+        # 6) IDLE 확인 후 get_current_posj 서비스를 준비하고 요청합니다.
+        if self._home_waiting_for_joint_sample:
+            if not self._current_posj_client.service_is_ready():
+                if self._service_wait_started_at is None:
+                    self._service_wait_started_at = now
+                    self.get_logger().warning(
+                        "aux_control/get_current_posj 서비스를 기다립니다."
+                    )
+                elif (
+                    now - self._service_wait_started_at
+                    > self._recovery_service_ready_timeout_sec
+                ):
+                    self._set_fault(
+                        "get_current_posj 서비스를 사용할 수 없어 홈 "
+                        "복귀 완료 여부를 확인하지 못했습니다."
+                    )
+                return
+
+            self._service_wait_started_at = None
+            self._home_waiting_for_joint_sample = False
+            self._home_joint_future = (
+                self._current_posj_client.call_async(
+                    GetCurrentPosj.Request()
+                )
+            )
+            self._home_future_started_at = now
+            return
+
+        # 7) 홈 동작 중에는 주기적으로 check_motion을 요청합니다.
+        if (
+            now - self._last_home_monitor_request_at
+            < self._recovery_home_monitor_period_sec
+        ):
+            return
+
+        if not self._check_motion_client.service_is_ready():
+            if self._service_wait_started_at is None:
+                self._service_wait_started_at = now
+                self.get_logger().warning(
+                    "motion/check_motion 서비스를 기다립니다."
+                )
+            elif (
+                now - self._service_wait_started_at
+                > self._recovery_service_ready_timeout_sec
+            ):
+                self._set_fault(
+                    "check_motion 서비스를 사용할 수 없어 홈 복귀 "
+                    "완료 여부를 확인하지 못했습니다."
+                )
+            return
+
+        self._service_wait_started_at = None
+        self._home_check_future = self._check_motion_client.call_async(
+            CheckMotion.Request()
+        )
+        self._home_future_started_at = now
+        self._last_home_monitor_request_at = now
+
     def _request_soft_stop(self, reason: str) -> None:
-        """이동 중이었다면 비동기 soft stop을 한 번 요청합니다."""
+        """fault/종료 시 soft stop을 요청하고 실패하면 재시도 가능하게 둡니다."""
 
         if self._dry_run or not self._motion_active:
             return
 
-        self._motion_active = False
+        # 앞선 요청의 응답을 기다리는 동안 같은 stop을 중복 전송하지 않습니다.
+        if self._stop_future is not None:
+            return
+
+        now = time.monotonic()
+        if now - self._last_stop_request_at < self._stop_retry_period_sec:
+            return
+
         if not self._stop_client.service_is_ready():
-            now = time.monotonic()
             if now - self._last_stop_warning_at >= 2.0:
                 self.get_logger().warning(
                     "motion/move_stop 서비스를 사용할 수 없어 "
-                    f"soft stop을 요청하지 못했습니다: {reason}"
+                    f"soft stop을 아직 요청하지 못했습니다. "
+                    f"서비스가 준비되면 다시 시도합니다: {reason}"
                 )
                 self._last_stop_warning_at = now
             return
 
         request = MoveStop.Request()
         request.stop_mode = 2  # DR_SSTOP: 감속 정지
-        future = self._stop_client.call_async(request)
+        try:
+            future = self._stop_client.call_async(request)
+        except Exception as error:
+            self.get_logger().error(
+                f"soft stop 요청 전송 오류, 다시 시도합니다: {error}"
+            )
+            self._last_stop_request_at = now
+            return
+
+        self._stop_future = future
+        self._last_stop_request_at = now
 
         def _stop_done(completed_future) -> None:
+            if self._stop_future is completed_future:
+                self._stop_future = None
             try:
                 response = completed_future.result()
                 if response is None or not response.success:
                     self.get_logger().error(
-                        f"soft stop 응답 실패: {reason}"
+                        f"soft stop 응답 실패, 다시 시도합니다: {reason}"
                     )
                 else:
+                    # 성공 응답을 받은 뒤에만 정지 요청이 끝난 것으로
+                    # 표시합니다. 실패 시 motion_active를 유지해 다음 tick이
+                    # 다시 stop을 요청할 수 있게 합니다.
+                    self._motion_active = False
                     self.get_logger().info(
-                        f"손 추종 soft stop 완료: {reason}"
+                        f"soft stop 완료: {reason}"
                     )
             except Exception as error:
                 self.get_logger().error(
-                    f"soft stop 서비스 오류: {error}"
+                    f"soft stop 서비스 오류, 다시 시도합니다: {error}"
                 )
 
         future.add_done_callback(_stop_done)
@@ -1113,35 +2259,15 @@ class HandFollowRobotNodeVerDepth(Node):
         )
         self.get_logger().info(
             "추종: "
+            f"state={self._follow_state.value}, "
             f"hand=({hand[0]:.3f}, {hand[1]:.3f}, {hand[2]:+.3f}), "
             f"offset=({offsets[0]:+.1f}, "
             f"{offsets[1]:+.1f}, {offsets[2]:+.1f}) mm, "
             f"fist={self._fist}, target={target_text}"
         )
 
-    def _control_tick(self) -> None:
-        """고정 주기로 안전 상태를 확인하고 최신 TCP 목표를 전송합니다."""
-
-        now = time.monotonic()
-
-        # RG2 요청은 로봇 추종 가능 여부와 별개로 손 검출과 fist 상태만
-        # 사용합니다. 예를 들어 깊이 보정 중이어도 손이 정상 검출되면
-        # OPEN/CLOSE 동작은 시험할 수 있습니다.
-        self._update_gripper_request_from_hand(now)
-
-        block_reason = self._tracking_block_reason(now)
-        if block_reason is not None:
-            if block_reason != self._last_block_reason:
-                self.get_logger().info(
-                    f"손 추종 대기/중지: {block_reason}"
-                )
-                self._last_block_reason = block_reason
-            self._request_soft_stop(block_reason)
-            return
-
-        if self._last_block_reason is not None:
-            self.get_logger().info("유효한 손 입력을 받아 추종을 시작합니다.")
-            self._last_block_reason = None
+    def _send_tracking_command(self, now: float) -> None:
+        """현재 손 위치를 계산해 최신 servol 목표를 한 번 전송합니다."""
 
         hand_position = self._latest_hand_position
         assert hand_position is not None
@@ -1157,8 +2283,7 @@ class HandFollowRobotNodeVerDepth(Node):
             or self._origin_pose is None
             or self._last_commanded_pose is None
         ):
-            self._faulted = True
-            self.get_logger().error(
+            self._set_fault(
                 "DSR 로봇 제어 함수 또는 초기 TCP pose가 준비되지 않았습니다."
             )
             return
@@ -1190,11 +2315,124 @@ class HandFollowRobotNodeVerDepth(Node):
             self._motion_active = True
             self._log_status(now, offsets, target_pose=limited_pose)
         except Exception as error:
-            self._faulted = True
-            self.get_logger().error(
+            self._set_fault(
                 f"servol 명령 중 오류가 발생했습니다: {error}"
             )
-            self._request_soft_stop("servol 오류")
+
+    def _control_tick(self) -> None:
+        """손 추종·감속·정지·홈 복귀 상태 머신을 한 단계 진행합니다."""
+
+        now = time.monotonic()
+
+        # 정상 대기/추종 중에만 새 손 모양을 RG2 목표로 사용합니다.
+        # 감속·유지·홈 복귀 중 손이 잠깐 다시 보이더라도 물체를 뜻밖에
+        # 놓지 않도록 마지막 그리퍼 상태를 그대로 유지합니다.
+        if self._follow_state in (
+            FollowState.WAITING_FOR_HAND,
+            FollowState.TRACKING,
+        ):
+            self._update_gripper_request_from_hand(now)
+
+        # 로봇/그리퍼 오류는 정상적인 손 유실과 구분합니다. fault일 때는
+        # 자동 홈으로 움직이지 않고 기존 DR_SSTOP을 한 번 요청합니다.
+        if self._faulted:
+            self._set_fault(
+                "로봇 또는 그리퍼 fault가 발생해 재시작이 필요합니다"
+            )
+            return
+
+        loss_reason = self._tracking_loss_reason(now)
+
+        if self._follow_state == FollowState.WAITING_FOR_HAND:
+            if loss_reason is not None:
+                if loss_reason != self._last_block_reason:
+                    self.get_logger().info(
+                        f"손 추종 대기: {loss_reason}"
+                    )
+                    self._last_block_reason = loss_reason
+                return
+
+            self._follow_state = FollowState.TRACKING
+            self._last_block_reason = None
+            self.get_logger().info(
+                "새로운 유효한 손 위치를 받아 추종을 시작합니다."
+            )
+            self._send_tracking_command(now)
+            return
+
+        if self._follow_state == FollowState.TRACKING:
+            if loss_reason is not None:
+                self._begin_tracking_loss(now, loss_reason)
+                return
+            self._send_tracking_command(now)
+            return
+
+        if self._follow_state in (
+            FollowState.DECELERATING,
+            FollowState.HOLDING,
+        ):
+            if self._tracking_loss_started_at is None:
+                self._set_fault(
+                    "자동 복귀 상태인데 손 유실 시작 시간이 없습니다."
+                )
+                return
+
+            loss_elapsed = now - self._tracking_loss_started_at
+            if loss_reason is None:
+                if loss_elapsed < self._recovery_loss_grace_sec:
+                    # speedl(0)으로 감속 중 즉시 servol을 다시 보내면 실제
+                    # TCP와 이전 명령 pose 차이 때문에 튈 수 있습니다.
+                    # 먼저 완전 정지를 확인한 뒤 실제 TCP에서 재개합니다.
+                    self._resume_after_stop_requested = True
+            else:
+                # 유예 시간 안에 보였다가 다시 사라진 손은 추종 재개
+                # 조건으로 사용하지 않습니다.
+                self._resume_after_stop_requested = False
+
+            if self._follow_state == FollowState.DECELERATING:
+                self._process_deceleration(now)
+                return
+
+            if (
+                self._resume_after_stop_requested
+                and loss_reason is None
+            ):
+                self._start_tracking_resume(now)
+                return
+
+            # HOLDING에서는 유예 시간과 정지 후 유지 시간이 모두 지나야
+            # 홈 복귀를 시작합니다.
+            if self._holding_started_at is None:
+                self._set_fault(
+                    "현재 위치 유지 상태인데 시작 시간이 없습니다."
+                )
+                return
+            grace_complete = (
+                loss_elapsed >= self._recovery_loss_grace_sec
+            )
+            hold_complete = (
+                now - self._holding_started_at
+                >= self._recovery_hold_before_home_sec
+            )
+            if grace_complete and hold_complete:
+                self._start_home_return(now)
+            return
+
+        if self._follow_state == FollowState.RESUMING_TRACKING:
+            self._process_tracking_resume(now, loss_reason)
+            return
+
+        if self._follow_state == FollowState.RETURNING_HOME:
+            self._process_home_return(now)
+            return
+
+        if self._follow_state == FollowState.FAULT:
+            self._request_soft_stop("자동 복귀 fault")
+            return
+
+        self._set_fault(
+            f"알 수 없는 손 추종 상태입니다: {self._follow_state}"
+        )
 
     def request_shutdown_stop(self) -> None:
         """노드 종료 전에 가능한 경우 마지막 soft stop을 요청합니다."""
@@ -1210,6 +2448,11 @@ class HandFollowRobotNodeVerDepth(Node):
         timer = getattr(self, "_control_timer", None)
         if timer is not None:
             timer.cancel()
+        self._cancel_recovery_futures()
+        stop_future = getattr(self, "_stop_future", None)
+        if stop_future is not None and not stop_future.done():
+            stop_future.cancel()
+        self._stop_future = None
         self._shutdown_gripper()
         return super().destroy_node()
 
