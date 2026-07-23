@@ -19,6 +19,7 @@ install(
     scripts/go_home
     scripts/gripper_test
     scripts/jog_complete
+    scripts/move_plate
   DESTINATION lib/${PROJECT_NAME}
 )
 
