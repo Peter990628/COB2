@@ -13,6 +13,16 @@
 * /hand_teleop/depth_valid (std_msgs/Bool)
 * /hand_teleop/fist (std_msgs/Bool)
 
+그리퍼 제어
+-----------
+``/hand_teleop/fist``는 ``hand_tracker_node_ver_depth``에서 이미 여러 프레임
+확인된 안정화 상태입니다.
+
+* 손을 펴면 RG2를 80.0 mm, 3.0 N으로 엽니다.
+* 주먹을 쥐면 RG2를 2.0 mm, 30.0 N으로 닫습니다.
+* 같은 상태가 유지되는 동안에는 같은 Modbus 명령을 반복하지 않습니다.
+* 손을 잃으면 물체를 떨어뜨리지 않도록 마지막 그리퍼 상태를 유지합니다.
+
 로봇 좌표 변환
 --------------
 노드는 실제 동작 모드에서 먼저 ``INITIAL_JOINT_POSE``로 이동한 뒤, 도착한
@@ -33,6 +43,7 @@ X는 중립 위치에서 전진 거리 0 mm이고, 손을 카메라 쪽으로 �
 * 실제 목표는 매번 초기 TCP pose로부터 계산해 상대 명령의 누적 오차를 막습니다.
 * 입력 범위, TCP 오프셋 범위, 한 주기 이동량, 속도와 가속도를 제한합니다.
 * 손 유실, 깊이 무효 또는 토픽 타임아웃 시 soft stop을 요청합니다.
+* RG2 통신은 별도 스레드에서 실행해 로봇 ``servol`` 주기를 막지 않습니다.
 * 이 소프트웨어 제한은 로봇의 안전 설정이나 비상정지 장치를 대신하지 않습니다.
 
 실행 예
@@ -47,11 +58,21 @@ Dry run:
 
     ros2 run hand_teleop hand_follow_robot_node_ver_depth --ros-args \
       -p dry_run:=false
+
+그리퍼 값을 실행할 때 바꾸는 예:
+
+    ros2 run hand_teleop hand_follow_robot_node_ver_depth --ros-args \
+      -p dry_run:=false \
+      -p gripper.open_width_mm:=80.0 \
+      -p gripper.open_force_n:=3.0 \
+      -p gripper.closed_width_mm:=2.0 \
+      -p gripper.closed_force_n:=30.0
 """
 
 from __future__ import annotations
 
 import math
+import threading
 import time
 from typing import Callable, List, Optional, Sequence, Tuple
 
@@ -62,6 +83,7 @@ from rclpy.node import Node
 from std_msgs.msg import Bool
 
 import DR_init
+from hand_teleop.onrobot import RG2
 
 
 ROBOT_ID = "dsr01"
@@ -135,14 +157,21 @@ class HandFollowRobotNodeVerDepth(Node):
         # ------------------------------------------------------------------
         # 실행 및 초기 자세 설정
         # ------------------------------------------------------------------
-        # True이면 로봇 모듈을 불러오거나 명령을 보내지 않고 계산 결과만
-        # 로그로 확인합니다. 실제 로봇 시험 때만 false로 변경합니다.
-        self.declare_parameter("dry_run", False)
+        # True이면 로봇과 RG2에 실제 명령을 보내지 않고 계산/제스처 결과만
+        # 로그로 확인합니다. 실제 장비 시험 때만 false로 변경합니다.
+        self.declare_parameter("dry_run", True)
+
+        # True이면 시작할 때 initial_joint_pose로 movej한 뒤 손 추종을
+        # 시작합니다. False이면 현재 TCP 위치를 추종 원점으로 사용합니다.
         self.declare_parameter("move_to_initial_pose", True)
+
+        # 손 추종을 시작하기 전 로봇이 이동할 6축 관절각 [degree]입니다.
         self.declare_parameter(
             "initial_joint_pose",
             [-90.0, 0.0, 90.0, -90.0, 90.0, 90.0],
         )
+
+        # 위 초기 movej에 적용할 관절 속도 [deg/s]와 가속도 [deg/s²]입니다.
         self.declare_parameter("initial_joint_velocity", 20.0)
         self.declare_parameter("initial_joint_acceleration", 40.0)
 
@@ -174,15 +203,60 @@ class HandFollowRobotNodeVerDepth(Node):
         # ------------------------------------------------------------------
         # servol 제어와 입력 watchdog
         # ------------------------------------------------------------------
+        # 10 Hz이면 0.1초마다 최신 손 좌표를 로봇 목표로 계산합니다.
         self.declare_parameter("control_rate_hz", 10.0)
+
+        # 이 시간 동안 새 위치 토픽이 없으면 손 추종을 감속 정지합니다.
         self.declare_parameter("hand_timeout_sec", 0.30)
+
+        # 한 제어 주기에 명령 위치가 축별로 변할 수 있는 최대값 [mm]입니다.
         self.declare_parameter("maximum_step_mm", 5.0)
+
+        # servol의 최대 TCP 선속도 [mm/s]와 회전속도 [deg/s]입니다.
         self.declare_parameter("servo_linear_velocity", 30.0)
         self.declare_parameter("servo_rotational_velocity", 10.0)
+
+        # servol의 최대 TCP 선가속도 [mm/s²]와 회전가속도 [deg/s²]입니다.
         self.declare_parameter("servo_linear_acceleration", 60.0)
         self.declare_parameter("servo_rotational_acceleration", 30.0)
+
+        # servol이 각 최신 목표에 도달하도록 요청하는 시간 [second]입니다.
         self.declare_parameter("servo_reach_time_sec", 0.15)
+
+        # 추종 상태 로그가 너무 많이 출력되지 않도록 하는 간격입니다.
         self.declare_parameter("status_log_period_sec", 1.0)
+
+        # ------------------------------------------------------------------
+        # OnRobot RG2 설정
+        # ------------------------------------------------------------------
+        # False로 실행하면 주먹 토픽은 받지만 RG2 명령은 전혀 보내지 않습니다.
+        self.declare_parameter("gripper.enabled", True)
+
+        # Compute Box 또는 Tool Changer Modbus TCP 주소와 포트입니다.
+        self.declare_parameter("gripper.ip", "192.168.1.1")
+        self.declare_parameter("gripper.port", 502)
+
+        # RG2 명령은 사람이 읽기 쉬운 mm와 N 단위로 설정합니다.
+        # 내부 Modbus 전송 직전에 각각 0.1 mm, 0.1 N raw 단위로 변환됩니다.
+        #
+        # 주의: 80.0 mm는 raw width=800입니다. RG2의 전체 폭 범위는
+        # 0~110 mm이고 공식 파지력 범위는 3~40 N입니다.
+        self.declare_parameter("gripper.open_width_mm", 80.0)
+        self.declare_parameter("gripper.open_force_n", 30.0)
+        self.declare_parameter("gripper.closed_width_mm", 2.0)
+        self.declare_parameter("gripper.closed_force_n", 30.0)
+
+        # Modbus 한 번의 통신 제한시간과 그리퍼 동작 완료 대기 제한시간입니다.
+        self.declare_parameter("gripper.modbus_timeout_sec", 1.0)
+        self.declare_parameter("gripper.motion_timeout_sec", 5.0)
+
+        # busy 상태를 다시 확인하는 주기입니다. 이 대기는 별도 스레드에서
+        # 실행되므로 로봇의 servol 타이머를 멈추지 않습니다.
+        self.declare_parameter("gripper.poll_period_sec", 0.05)
+
+        # 손이 재검출된 직후에는 fist 토픽의 안정화 결과를 기다립니다.
+        # 0.35초는 기본 30 FPS, fist_confirm_frames=8보다 조금 긴 값입니다.
+        self.declare_parameter("gripper.hand_reacquire_delay_sec", 0.35)
 
         # ------------------------------------------------------------------
         # 구독 토픽
@@ -210,6 +284,8 @@ class HandFollowRobotNodeVerDepth(Node):
         self._hand_detected = False
         self._depth_valid = False
         self._fist = False
+        self._hand_session_started_at: Optional[float] = None
+        self._last_fist_received_at: Optional[float] = None
 
         self._origin_pose: Optional[Pose6] = None
         self._last_commanded_pose: Optional[Pose6] = None
@@ -222,6 +298,17 @@ class HandFollowRobotNodeVerDepth(Node):
         # 실제 모드에서 채워지는 DSR 함수 참조입니다.
         self._servol: Optional[Callable] = None
         self._posx: Optional[Callable] = None
+
+        # RG2 Modbus 객체는 실제 모드에서만 생성합니다. 주먹 콜백에서 직접
+        # 통신하면 servol 타이머가 지연될 수 있으므로 Condition과 작업 스레드를
+        # 사용해 원하는 상태만 전달합니다.
+        self._gripper: Optional[RG2] = None
+        self._gripper_condition = threading.Condition()
+        self._gripper_requested_closed: Optional[bool] = None
+        self._gripper_commanded_closed: Optional[bool] = None
+        self._gripper_shutdown_requested = False
+        self._gripper_cleaned_up = False
+        self._gripper_worker: Optional[threading.Thread] = None
 
         position_topic = str(
             self.get_parameter("position_topic").value
@@ -264,12 +351,25 @@ class HandFollowRobotNodeVerDepth(Node):
             "motion/move_stop",
         )
 
-        if self._dry_run:
-            self.get_logger().warning(
-                "DRY RUN: 로봇 초기 이동과 servol 명령을 보내지 않습니다."
-            )
-        else:
-            self._initialise_robot()
+        try:
+            if self._dry_run:
+                self.get_logger().warning(
+                    "DRY RUN: 로봇 초기 이동, servol 및 RG2 명령을 "
+                    "실제로 보내지 않습니다."
+                )
+            else:
+                # RG2 연결을 먼저 확인한 뒤 로봇을 초기 위치로 움직입니다.
+                # 그리퍼 연결 실패 상태에서 로봇만 움직이는 일을 막기 위함입니다.
+                self._initialise_gripper()
+                self._initialise_robot()
+
+            # Dry run에서도 제스처에 따른 OPEN/CLOSE 계산 로그를 확인할 수
+            # 있도록 작업 스레드는 시작합니다.
+            self._start_gripper_worker()
+        except Exception:
+            # 생성 도중 실패하면 열린 Modbus 소켓을 남기지 않습니다.
+            self._shutdown_gripper()
+            raise
 
         self._control_timer = self.create_timer(
             1.0 / self._control_rate_hz,
@@ -292,10 +392,20 @@ class HandFollowRobotNodeVerDepth(Node):
             "실제 장비에서는 주변 충돌과 네 모서리 도달 가능성을 먼저 "
             "확인하고 더 작은 값부터 시험하세요."
         )
-        self.get_logger().info(
-            "주먹 토픽은 상태만 수신하며 이번 버전에서는 그리퍼를 "
-            "동작시키지 않습니다."
-        )
+        if self._gripper_enabled:
+            self.get_logger().info(
+                "RG2 손 제스처 제어: "
+                f"OPEN={self._gripper_open_width_mm:.1f} mm/"
+                f"{self._gripper_open_force_n:.1f} N, "
+                f"FIST={self._gripper_closed_width_mm:.1f} mm/"
+                f"{self._gripper_closed_force_n:.1f} N. "
+                "손 유실 시에는 마지막 그리퍼 상태를 유지합니다."
+            )
+        else:
+            self.get_logger().warning(
+                "gripper.enabled=False: 주먹 토픽을 받아도 RG2를 "
+                "동작시키지 않습니다."
+            )
 
     def _read_and_validate_parameters(self) -> None:
         """ROS 파라미터를 멤버 변수로 읽고 잘못된 설정을 차단합니다."""
@@ -378,6 +488,47 @@ class HandFollowRobotNodeVerDepth(Node):
             self.get_parameter("status_log_period_sec").value
         )
 
+        # RG2 사용 여부와 Modbus 연결 정보를 읽습니다.
+        self._gripper_enabled = bool(
+            self.get_parameter("gripper.enabled").value
+        )
+        self._gripper_ip = str(
+            self.get_parameter("gripper.ip").value
+        ).strip()
+        self._gripper_port = int(
+            self.get_parameter("gripper.port").value
+        )
+
+        # 아래 네 값은 실제 단위가 mm와 N이므로 raw 값보다 설정 의도가
+        # 명확합니다. RG2 드라이버가 전송 직전에 10을 곱해 변환합니다.
+        self._gripper_open_width_mm = float(
+            self.get_parameter("gripper.open_width_mm").value
+        )
+        self._gripper_open_force_n = float(
+            self.get_parameter("gripper.open_force_n").value
+        )
+        self._gripper_closed_width_mm = float(
+            self.get_parameter("gripper.closed_width_mm").value
+        )
+        self._gripper_closed_force_n = float(
+            self.get_parameter("gripper.closed_force_n").value
+        )
+
+        self._gripper_modbus_timeout_sec = float(
+            self.get_parameter("gripper.modbus_timeout_sec").value
+        )
+        self._gripper_motion_timeout_sec = float(
+            self.get_parameter("gripper.motion_timeout_sec").value
+        )
+        self._gripper_poll_period_sec = float(
+            self.get_parameter("gripper.poll_period_sec").value
+        )
+        self._gripper_hand_reacquire_delay_sec = float(
+            self.get_parameter(
+                "gripper.hand_reacquire_delay_sec"
+            ).value
+        )
+
         numeric_values = (
             self._initial_joint_pose
             + [
@@ -403,6 +554,15 @@ class HandFollowRobotNodeVerDepth(Node):
                 self._servo_rotational_acceleration,
                 self._servo_reach_time_sec,
                 self._status_log_period_sec,
+                float(self._gripper_port),
+                self._gripper_open_width_mm,
+                self._gripper_open_force_n,
+                self._gripper_closed_width_mm,
+                self._gripper_closed_force_n,
+                self._gripper_modbus_timeout_sec,
+                self._gripper_motion_timeout_sec,
+                self._gripper_poll_period_sec,
+                self._gripper_hand_reacquire_delay_sec,
             ]
         )
         if not all(math.isfinite(value) for value in numeric_values):
@@ -440,6 +600,255 @@ class HandFollowRobotNodeVerDepth(Node):
             or self._status_log_period_sec <= 0.0
         ):
             raise ValueError("제어 주기·제한·속도·가속도는 0보다 커야 합니다.")
+
+        # RG2 공식 사양:
+        #   폭 0~110 mm, 힘 3~40 N
+        # 사용자가 실수로 raw 값(예: 800)을 mm 자리에 넣는 것도 여기서
+        # 즉시 차단해 잘못된 Modbus 명령을 보내지 않게 합니다.
+        gripper_values = (
+            ("gripper.open_width_mm", self._gripper_open_width_mm),
+            ("gripper.closed_width_mm", self._gripper_closed_width_mm),
+        )
+        for name, value in gripper_values:
+            if not 0.0 <= value <= 110.0:
+                raise ValueError(f"{name}는 RG2 범위 0~110 mm여야 합니다.")
+
+        gripper_forces = (
+            ("gripper.open_force_n", self._gripper_open_force_n),
+            ("gripper.closed_force_n", self._gripper_closed_force_n),
+        )
+        for name, value in gripper_forces:
+            if not 3.0 <= value <= 40.0:
+                raise ValueError(f"{name}는 RG2 범위 3~40 N이어야 합니다.")
+
+        if (
+            self._gripper_closed_width_mm
+            >= self._gripper_open_width_mm
+        ):
+            raise ValueError(
+                "gripper.closed_width_mm는 open_width_mm보다 작아야 합니다."
+            )
+        if not self._gripper_ip:
+            raise ValueError("gripper.ip는 빈 문자열일 수 없습니다.")
+        if not 1 <= self._gripper_port <= 65535:
+            raise ValueError("gripper.port는 1~65535 범위여야 합니다.")
+        if (
+            self._gripper_modbus_timeout_sec <= 0.0
+            or self._gripper_motion_timeout_sec <= 0.0
+            or self._gripper_poll_period_sec <= 0.0
+            or self._gripper_hand_reacquire_delay_sec < 0.0
+        ):
+            raise ValueError(
+                "RG2 timeout/poll 값은 0보다 커야 하고 "
+                "hand_reacquire_delay_sec는 0 이상이어야 합니다."
+            )
+
+    def _initialise_gripper(self) -> None:
+        """실제 동작 모드에서 OnRobot RG2 Modbus TCP 연결을 엽니다."""
+
+        if not self._gripper_enabled:
+            return
+
+        self.get_logger().info(
+            "RG2 Modbus TCP 연결을 시작합니다: "
+            f"{self._gripper_ip}:{self._gripper_port}"
+        )
+        self._gripper = RG2(
+            ip=self._gripper_ip,
+            port=self._gripper_port,
+            timeout_sec=self._gripper_modbus_timeout_sec,
+        )
+        self.get_logger().info("RG2 Modbus TCP 연결을 확인했습니다.")
+
+    def _start_gripper_worker(self) -> None:
+        """그리퍼 통신 전용 작업 스레드를 한 번 시작합니다."""
+
+        if not self._gripper_enabled or self._gripper_worker is not None:
+            return
+
+        self._gripper_worker = threading.Thread(
+            target=self._gripper_worker_main,
+            name="rg2_gesture_worker",
+            daemon=True,
+        )
+        self._gripper_worker.start()
+
+    def _request_gripper_state(self, closed: bool) -> None:
+        """작업 스레드에 최신 OPEN/CLOSE 목표를 비동기로 전달합니다."""
+
+        if not self._gripper_enabled:
+            return
+
+        with self._gripper_condition:
+            # 같은 목표가 계속 들어오면 Condition을 깨우거나 Modbus 명령을
+            # 반복하지 않습니다. 오직 OPEN↔FIST 전환만 처리합니다.
+            if self._gripper_requested_closed == closed:
+                return
+            self._gripper_requested_closed = closed
+            self._gripper_condition.notify_all()
+
+    def _update_gripper_request_from_hand(self, now: float) -> None:
+        """유효한 새 손 세션의 안정화 fist 상태만 RG2 목표로 사용합니다."""
+
+        if not self._gripper_enabled or not self._hand_detected:
+            # 손을 잃었을 때 OPEN을 보내면 들고 있던 물체가 떨어질 수
+            # 있으므로 아무 명령도 보내지 않고 마지막 상태를 유지합니다.
+            return
+        if (
+            self._hand_session_started_at is None
+            or self._last_fist_received_at is None
+            or self._last_fist_received_at
+            < self._hand_session_started_at
+        ):
+            return
+        if (
+            now - self._hand_session_started_at
+            < self._gripper_hand_reacquire_delay_sec
+        ):
+            # 손을 처음 잡은 직후 stable_fist=False가 잠시 발행되는 동안
+            # 실제 주먹인데도 RG2가 먼저 열리는 것을 방지합니다.
+            return
+
+        self._request_gripper_state(closed=self._fist)
+
+    def _wait_until_gripper_idle(self) -> bool:
+        """RG2 busy가 해제될 때까지 작업 스레드에서 제한 시간만 기다립니다."""
+
+        if self._gripper is None:
+            raise RuntimeError("RG2 연결 객체가 없습니다.")
+
+        deadline = time.monotonic() + self._gripper_motion_timeout_sec
+        while time.monotonic() < deadline:
+            with self._gripper_condition:
+                if self._gripper_shutdown_requested:
+                    return False
+
+            status = self._gripper.get_status()
+            if status.safety_fault:
+                raise RuntimeError(
+                    "RG2 안전 스위치 또는 안전 회로 오류가 감지됐습니다."
+                )
+            if not status.busy:
+                return True
+
+            time.sleep(self._gripper_poll_period_sec)
+
+        raise TimeoutError(
+            "RG2의 이전 동작이 제한 시간 안에 끝나지 않았습니다."
+        )
+
+    def _gripper_worker_main(self) -> None:
+        """OPEN/CLOSE 상태 전환을 순서대로 처리하는 Modbus 작업 루프입니다."""
+
+        while True:
+            with self._gripper_condition:
+                self._gripper_condition.wait_for(
+                    lambda: (
+                        self._gripper_shutdown_requested
+                        or (
+                            self._gripper_requested_closed is not None
+                            and self._gripper_requested_closed
+                            != self._gripper_commanded_closed
+                        )
+                    )
+                )
+                if self._gripper_shutdown_requested:
+                    return
+                requested_closed = self._gripper_requested_closed
+
+            assert requested_closed is not None
+
+            # Dry run은 장치에 연결하지 않고 상태 전환과 설정값만 보여줍니다.
+            if self._dry_run:
+                description = "CLOSE(FIST)" if requested_closed else "OPEN"
+                width_mm, force_n = self._gripper_target(requested_closed)
+                self.get_logger().info(
+                    "DRY RUN RG2: "
+                    f"{description}, width={width_mm:.1f} mm, "
+                    f"force={force_n:.1f} N"
+                )
+                with self._gripper_condition:
+                    self._gripper_commanded_closed = requested_closed
+                continue
+
+            try:
+                if not self._wait_until_gripper_idle():
+                    return
+
+                # 이전 동작을 기다리는 사이 손 모양이 다시 바뀌었을 수
+                # 있으므로 대기 후 가장 최신 목표를 다시 읽습니다.
+                with self._gripper_condition:
+                    if self._gripper_shutdown_requested:
+                        return
+                    requested_closed = self._gripper_requested_closed
+                    if (
+                        requested_closed is None
+                        or requested_closed
+                        == self._gripper_commanded_closed
+                    ):
+                        continue
+
+                width_mm, force_n = self._gripper_target(
+                    requested_closed
+                )
+                assert self._gripper is not None
+                self._gripper.move_gripper_mm_n(
+                    width_mm=width_mm,
+                    force_n=force_n,
+                )
+
+                description = "CLOSE(FIST)" if requested_closed else "OPEN"
+                self.get_logger().info(
+                    "RG2 명령 전송: "
+                    f"{description}, width={width_mm:.1f} mm, "
+                    f"force={force_n:.1f} N"
+                )
+                with self._gripper_condition:
+                    self._gripper_commanded_closed = requested_closed
+            except Exception as error:
+                # 그리퍼 통신 장애가 생겼는데 로봇만 계속 움직이지 않도록
+                # 공통 fault를 올립니다. 다음 control tick에서 soft stop합니다.
+                self.get_logger().error(f"RG2 제어 오류: {error}")
+                self._faulted = True
+                return
+
+    def _gripper_target(self, closed: bool) -> Tuple[float, float]:
+        """손 상태에 해당하는 RG2 목표 폭 [mm]과 힘 [N]을 반환합니다."""
+
+        if closed:
+            return (
+                self._gripper_closed_width_mm,
+                self._gripper_closed_force_n,
+            )
+        return (
+            self._gripper_open_width_mm,
+            self._gripper_open_force_n,
+        )
+
+    def _shutdown_gripper(self) -> None:
+        """작업 스레드를 끝낸 뒤 RG2 Modbus 소켓을 안전하게 닫습니다."""
+
+        if self._gripper_cleaned_up:
+            return
+        self._gripper_cleaned_up = True
+
+        with self._gripper_condition:
+            self._gripper_shutdown_requested = True
+            self._gripper_condition.notify_all()
+
+        worker = self._gripper_worker
+        if worker is not None and worker.is_alive():
+            worker.join(
+                timeout=self._gripper_modbus_timeout_sec + 1.0
+            )
+            if worker.is_alive():
+                self.get_logger().warning(
+                    "RG2 작업 스레드가 제한 시간 안에 종료되지 않았습니다."
+                )
+
+        if self._gripper is not None:
+            self._gripper.close_connection()
+            self._gripper = None
 
     def _initialise_robot(self) -> None:
         """DSR 모듈을 초기화하고 초기 관절/TCP 기준 자세를 설정합니다."""
@@ -537,9 +946,17 @@ class HandFollowRobotNodeVerDepth(Node):
         self._last_position_received_at = time.monotonic()
 
     def _detected_callback(self, message: Bool) -> None:
-        """현재 손 검출 여부를 저장합니다."""
+        """손 검출 여부와 새 손 세션의 시작 시간을 저장합니다."""
 
-        self._hand_detected = bool(message.data)
+        detected = bool(message.data)
+        if detected and not self._hand_detected:
+            # 새 손이 검출된 시각을 기록해 이전 손 세션의 fist=False가
+            # 새 세션의 OPEN 명령으로 잘못 사용되지 않게 합니다.
+            self._hand_session_started_at = time.monotonic()
+        elif not detected:
+            self._hand_session_started_at = None
+
+        self._hand_detected = detected
 
     def _depth_valid_callback(self, message: Bool) -> None:
         """상대 깊이 보정 및 현재 깊이 유효 여부를 저장합니다."""
@@ -547,9 +964,10 @@ class HandFollowRobotNodeVerDepth(Node):
         self._depth_valid = bool(message.data)
 
     def _fist_callback(self, message: Bool) -> None:
-        """향후 그리퍼 동작에 사용할 안정화된 주먹 상태를 저장합니다."""
+        """그리퍼 동작에 사용할 안정화된 주먹 상태와 시간을 저장합니다."""
 
         self._fist = bool(message.data)
+        self._last_fist_received_at = time.monotonic()
 
     def _tracking_block_reason(self, now: float) -> Optional[str]:
         """현재 로봇 추종을 중단해야 하는 이유를 반환합니다."""
@@ -705,6 +1123,12 @@ class HandFollowRobotNodeVerDepth(Node):
         """고정 주기로 안전 상태를 확인하고 최신 TCP 목표를 전송합니다."""
 
         now = time.monotonic()
+
+        # RG2 요청은 로봇 추종 가능 여부와 별개로 손 검출과 fist 상태만
+        # 사용합니다. 예를 들어 깊이 보정 중이어도 손이 정상 검출되면
+        # OPEN/CLOSE 동작은 시험할 수 있습니다.
+        self._update_gripper_request_from_hand(now)
+
         block_reason = self._tracking_block_reason(now)
         if block_reason is not None:
             if block_reason != self._last_block_reason:
@@ -781,11 +1205,12 @@ class HandFollowRobotNodeVerDepth(Node):
         self._request_soft_stop("노드 종료")
 
     def destroy_node(self) -> bool:
-        """타이머를 정리한 뒤 ROS 노드를 종료합니다."""
+        """타이머·RG2 연결을 정리한 뒤 ROS 노드를 종료합니다."""
 
         timer = getattr(self, "_control_timer", None)
         if timer is not None:
             timer.cancel()
+        self._shutdown_gripper()
         return super().destroy_node()
 
 
