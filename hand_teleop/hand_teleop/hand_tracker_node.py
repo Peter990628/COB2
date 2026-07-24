@@ -21,7 +21,7 @@ Doosan 로봇을 실제로 움직이는 코드는 이후에 만들
 이 노드가 발행하는 X/Y는 로봇의 mm 좌표가 아니라 0.0~1.0 영상 좌표입니다.
 다음 단계의 로봇 제어 노드에서 아래와 같이 변환할 예정입니다.
 
-    손 화면 +X -> 로봇 BASE -Y
+    손 화면 +X -> 로봇 BASE +Y
     손 화면 +Y -> 로봇 BASE -Z
 
 MediaPipe Tasks API는 별도의 ``hand_landmarker.task`` 모델 파일을 필요로 합니다.
@@ -616,8 +616,14 @@ class HandTrackerNode(Node):
         folded_count: int,
         handedness_text: str,
         published_z: Optional[float] = None,
+        display_window: bool = True,
     ) -> None:
-        """손 랜드마크와 현재 판정 상태를 OpenCV 창에 표시합니다."""
+        """손 랜드마크와 판정 상태를 그리고 필요할 때 OpenCV 창에 표시합니다.
+
+        ``frame`` 자체에 주석을 그리므로, ``display_window=False``로 호출한
+        뒤에도 호출자는 완성된 주석 영상을 ROS 이미지 토픽 등으로 사용할 수
+        있습니다.
+        """
 
         height, width = frame.shape[:2]
 
@@ -742,6 +748,12 @@ class HandTrackerNode(Node):
             1,
             cv2.LINE_AA,
         )
+
+        # UI에서 ROS 이미지 토픽만 사용할 때는 주석까지 그린 뒤 로컬 GUI는
+        # 열지 않습니다. 영상 생성과 imshow를 분리하면 headless 환경에서도
+        # 같은 주석 영상을 발행할 수 있습니다.
+        if not display_window:
+            return
 
         try:
             cv2.imshow(self._window_name, frame)

@@ -17,6 +17,10 @@
 * /hand_teleop/fist (std_msgs/Bool)
 * /hand_teleop/depth_valid (std_msgs/Bool)
     - 중립 손 크기 보정이 끝나 현재 Z를 사용할 수 있는지 나타냅니다.
+* /hand_teleop/annotated_image (sensor_msgs/Image)
+    - 웹캠 영상에 손 랜드마크, 중심점, 주먹 및 깊이 상태를 그린 BGR8
+      영상입니다. UI에서는 이 토픽을 구독해 로컬 OpenCV 창과 같은 내용을
+      표시할 수 있습니다.
 
 중요
 ----
@@ -48,6 +52,7 @@ import cv2
 import mediapipe as mp
 import numpy as np
 import rclpy
+from sensor_msgs.msg import Image
 from std_msgs.msg import Bool
 
 from hand_teleop.hand_tracker_node import (
@@ -161,6 +166,22 @@ class DepthHandTrackerNode(HandTrackerNode):
             "/hand_teleop/depth_valid",
         )
 
+        # ------------------------------------------------------------------
+        # UI용 주석 영상 토픽 설정
+        # ------------------------------------------------------------------
+        # True이면 손 랜드마크와 상태 글자가 그려진 최종 BGR 영상을
+        # sensor_msgs/Image로 발행합니다. show_debug_window=False여도 이
+        # 토픽은 계속 발행되므로 통합 UI만 띄우는 구성에 사용할 수 있습니다.
+        self.declare_parameter("publish_annotated_image", True)
+        self.declare_parameter(
+            "annotated_image_topic",
+            "/hand_teleop/annotated_image",
+        )
+        self.declare_parameter(
+            "annotated_image_frame_id",
+            "webcam_annotated",
+        )
+
         self._depth_calibration_frames = int(
             self.get_parameter("depth_calibration_frames").value
         )
@@ -237,6 +258,38 @@ class DepthHandTrackerNode(HandTrackerNode):
             10,
         )
 
+        self._publish_annotated_image = bool(
+            self.get_parameter("publish_annotated_image").value
+        )
+        self._annotated_image_topic = str(
+            self.get_parameter("annotated_image_topic").value
+        )
+        self._annotated_image_frame_id = str(
+            self.get_parameter("annotated_image_frame_id").value
+        )
+        if (
+            self._publish_annotated_image
+            and not self._annotated_image_topic.strip()
+        ):
+            raise ValueError(
+                "publish_annotated_image=True이면 "
+                "annotated_image_topic이 비어 있으면 안 됩니다."
+            )
+
+        # 이미지가 UI 처리 속도보다 빠르게 도착해도 오래된 프레임이 쌓이지
+        # 않도록 큐 깊이를 1로 둡니다. sensor_msgs/Image를 직접 구성하므로
+        # 현재 NumPy 2 환경과 ROS Humble cv_bridge 사이의 ABI 충돌도
+        # 피할 수 있습니다.
+        self._annotated_image_publisher = (
+            self.create_publisher(
+                Image,
+                self._annotated_image_topic,
+                1,
+            )
+            if self._publish_annotated_image
+            else None
+        )
+
         if self._depth_reference_palm_size_px is None:
             self.get_logger().info(
                 "상대 깊이 중립 보정을 시작합니다. "
@@ -252,6 +305,12 @@ class DepthHandTrackerNode(HandTrackerNode):
             "깊이 규칙: 카메라 쪽=+Z, 카메라 반대쪽=-Z, "
             f"범위=-1.0~+1.0, valid={depth_valid_topic}"
         )
+        if self._annotated_image_publisher is not None:
+            self.get_logger().info(
+                "UI용 주석 영상을 발행합니다: "
+                f"topic={self._annotated_image_topic}, "
+                "encoding=bgr8"
+            )
 
     def _is_valid_palm_size(self, palm_size_px: float) -> bool:
         """손바닥 크기가 깊이 계산에 사용할 수 있는 범위인지 확인합니다."""
@@ -372,6 +431,36 @@ class DepthHandTrackerNode(HandTrackerNode):
         """현재 프레임의 상대 깊이를 사용할 수 있는지 발행합니다."""
 
         self._depth_valid_publisher.publish(Bool(data=valid))
+
+    def _publish_annotated_frame(self, frame: np.ndarray) -> None:
+        """주석이 모두 그려진 BGR 프레임을 ROS ``Image``로 발행합니다.
+
+        ``cv_bridge``를 사용하지 않고 메시지 필드를 직접 채웁니다. 현재
+        프로젝트의 NumPy 2.x 환경에서는 Ubuntu 22.04/ROS Humble에 포함된
+        cv_bridge가 NumPy 1.x ABI로 빌드되어 충돌할 수 있기 때문입니다.
+        """
+
+        publisher = self._annotated_image_publisher
+        if publisher is None:
+            return
+
+        image = np.ascontiguousarray(frame, dtype=np.uint8)
+        if image.ndim != 3 or image.shape[2] != 3:
+            raise ValueError(
+                "주석 영상은 HxWx3 BGR 배열이어야 합니다."
+            )
+
+        height, width = image.shape[:2]
+        message = Image()
+        message.header.stamp = self.get_clock().now().to_msg()
+        message.header.frame_id = self._annotated_image_frame_id
+        message.height = int(height)
+        message.width = int(width)
+        message.encoding = "bgr8"
+        message.is_bigendian = 0
+        message.step = int(width * 3)
+        message.data = image.tobytes()
+        publisher.publish(message)
 
     def _handle_no_hand(self) -> None:
         """손을 놓치면 Z 필터를 초기화하고 깊이를 무효화합니다."""
@@ -625,7 +714,9 @@ class DepthHandTrackerNode(HandTrackerNode):
         else:
             self._handle_no_hand()
 
-        if self._show_debug_window:
+        # 로컬 OpenCV 창과 ROS UI 영상 발행을 서로 독립적으로 사용할 수
+        # 있도록, 둘 중 하나라도 필요하면 동일한 최종 주석 프레임을 만듭니다.
+        if self._show_debug_window or self._publish_annotated_image:
             self._draw_depth_debug(
                 frame,
                 palm_width_px,
@@ -649,7 +740,10 @@ class DepthHandTrackerNode(HandTrackerNode):
                     if depth_valid and filtered_depth is not None
                     else 0.0
                 ),
+                display_window=self._show_debug_window,
             )
+            if rclpy.ok():
+                self._publish_annotated_frame(frame)
 
 
 def main(args: Optional[Sequence[str]] = None) -> None:

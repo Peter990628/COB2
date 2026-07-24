@@ -29,7 +29,7 @@
 TCP의 BASE pose를 원점으로 저장합니다. 이후 화면 좌표는 다음처럼 초기 TCP
 기준 오프셋으로 변환됩니다.
 
-* 손 화면 +X(오른쪽) -> 로봇 BASE -Y
+* 손 화면 +X(오른쪽) -> 로봇 BASE +Y
 * 손 화면 +Y(아래쪽) -> 로봇 BASE -Z
 * 손 깊이 +Z(카메라 쪽) -> 로봇 BASE -X
 
@@ -1525,13 +1525,13 @@ class HandFollowRobotNodeVerDepth(Node):
         )
         x_offset = self._x_direction_sign * x_travel
 
-        # 화면 왼쪽 -> +Y, 화면 오른쪽 -> -Y
+        # 화면 왼쪽 -> -Y, 화면 오른쪽(+X) -> +Y
         y_offset = map_clamped(
             hand_x,
             self._screen_x_min,
             self._screen_x_max,
-            self._y_offset_max_mm,
             self._y_offset_min_mm,
+            self._y_offset_max_mm,
         )
 
         # 화면 위쪽 -> +Z, 화면 아래쪽 -> -Z
