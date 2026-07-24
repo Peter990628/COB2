@@ -69,6 +69,13 @@ Dry run:
       -p gripper.open_force_n:=30.0 \
       -p gripper.closed_width_mm:=2.0 \
       -p gripper.closed_force_n:=30.0
+
+XYZ 명령 가속도를 더 천천히 시험하는 예:
+
+    ros2 run hand_teleop hand_follow_robot_node_ver_depth --ros-args \
+      -p dry_run:=false \
+      -p maximum_step_mm:=1.0 \
+      -p command_linear_acceleration_mm_s2:=15.0
 """
 # hand_follow_robot_node_ver_depth
 from __future__ import annotations
@@ -107,6 +114,7 @@ DR_init.__dsr__model = ROBOT_MODEL
 
 Pose6 = List[float]
 HandPosition = Tuple[float, float, float]
+LinearVelocity3 = Tuple[float, float, float]
 
 
 class FollowState(Enum):
@@ -193,6 +201,131 @@ def limit_linear_step(
     return result
 
 
+def smooth_linear_step(
+    previous_pose: Sequence[float],
+    desired_pose: Sequence[float],
+    previous_velocity: Sequence[float],
+    maximum_velocity_mm_s: float,
+    maximum_step_mm: float,
+    maximum_acceleration_mm_s2: float,
+    control_period_sec: float,
+) -> Tuple[Pose6, LinearVelocity3]:
+    """XYZ 속도의 크기와 방향 변화를 가속도 한도 안에서 부드럽게 합니다.
+
+    ``maximum_velocity_mm_s``와 ``maximum_step_mm``은 각각 명령 속도와
+    한 주기 이동거리의 상한입니다. 이 함수는 거기에 더해 이전 주기의 XYZ
+    명령 속도에서 이번 속도로 변할 수 있는 벡터 크기를
+    ``acceleration * period`` 이하로 제한합니다. 따라서 손 목표가
+    반대편으로 갑자기 바뀌어도 명령 속도가 한 번에 반전되지 않고 0을
+    향해 감속한 뒤 반대 방향으로 가속합니다.
+    """
+
+    if len(previous_pose) < 6 or len(desired_pose) < 6:
+        raise ValueError("previous_pose와 desired_pose는 값 6개가 필요합니다.")
+    if len(previous_velocity) != 3:
+        raise ValueError("previous_velocity는 XYZ 속도 3개가 필요합니다.")
+    if (
+        maximum_velocity_mm_s <= 0.0
+        or maximum_step_mm <= 0.0
+        or maximum_acceleration_mm_s2 <= 0.0
+        or control_period_sec <= 0.0
+    ):
+        raise ValueError(
+            "속도·이동거리·가속도·제어주기는 0보다 커야 합니다."
+        )
+
+    position_error = [
+        float(desired_pose[axis]) - float(previous_pose[axis])
+        for axis in range(3)
+    ]
+    remaining_distance = math.sqrt(
+        sum(delta * delta for delta in position_error)
+    )
+
+    if remaining_distance <= 1.0e-9:
+        target_velocity = [0.0, 0.0, 0.0]
+    else:
+        # 목표 근처까지 최대 속도로 갔다가 지나치게 크게 오버슈트하지
+        # 않도록, 남은 거리 안에서 정지 가능한 속도 sqrt(2*a*s)도 함께
+        # 적용합니다. 먼 곳에서는 maximum_step_mm 속도 제한이 우선하고,
+        # 가까워지면 이 제동 속도 제한이 자연스럽게 감속을 시작합니다.
+        braking_velocity_mm_s = math.sqrt(
+            2.0
+            * maximum_acceleration_mm_s2
+            * remaining_distance
+        )
+        target_speed_mm_s = min(
+            maximum_velocity_mm_s,
+            braking_velocity_mm_s,
+            remaining_distance / control_period_sec,
+        )
+        target_velocity = [
+            delta * target_speed_mm_s / remaining_distance
+            for delta in position_error
+        ]
+
+    velocity_change = [
+        target_velocity[axis] - float(previous_velocity[axis])
+        for axis in range(3)
+    ]
+    velocity_change_norm = math.sqrt(
+        sum(delta * delta for delta in velocity_change)
+    )
+    maximum_velocity_change = (
+        maximum_acceleration_mm_s2 * control_period_sec
+    )
+
+    # 축별로 각각 제한하면 대각선 방향의 전체 가속도가 더 커질 수
+    # 있으므로 XYZ 속도 변화 벡터 전체의 길이를 기준으로 제한합니다.
+    if velocity_change_norm > maximum_velocity_change:
+        scale = maximum_velocity_change / velocity_change_norm
+        velocity_change = [
+            delta * scale for delta in velocity_change
+        ]
+
+    smoothed_velocity = [
+        float(previous_velocity[axis]) + velocity_change[axis]
+        for axis in range(3)
+    ]
+
+    # 부동소수점 오차나 잘못된 외부 초기값이 있더라도 명령 속도가
+    # maximum_step_mm에서 유도한 상한을 넘지 않게 한 번 더 보호합니다.
+    smoothed_speed = math.sqrt(
+        sum(component * component for component in smoothed_velocity)
+    )
+    if smoothed_speed > maximum_velocity_mm_s:
+        scale = maximum_velocity_mm_s / smoothed_speed
+        smoothed_velocity = [
+            component * scale for component in smoothed_velocity
+        ]
+
+    smoothed_pose = [float(value) for value in desired_pose]
+    for axis in range(3):
+        smoothed_pose[axis] = (
+            float(previous_pose[axis])
+            + smoothed_velocity[axis] * control_period_sec
+        )
+
+    # 위 계산상 이미 maximum_step_mm 이하이지만 마지막 안전장치로 기존
+    # XYZ 벡터 이동거리 제한도 그대로 적용합니다.
+    smoothed_pose = limit_linear_step(
+        previous_pose,
+        smoothed_pose,
+        maximum_step_mm,
+    )
+
+    # 최종 pose가 안전 제한에 의해 조정되었을 수 있으므로 다음 주기에
+    # 저장할 속도는 실제 명령 pose 차이에서 다시 계산합니다.
+    actual_velocity: LinearVelocity3 = tuple(
+        (
+            float(smoothed_pose[axis]) - float(previous_pose[axis])
+        )
+        / control_period_sec
+        for axis in range(3)
+    )
+    return smoothed_pose, actual_velocity
+
+
 class HandFollowRobotNodeVerDepth(Node):
     """손의 정규화 X/Y/Z를 제한된 M0609 TCP pose로 변환합니다."""
 
@@ -263,6 +396,19 @@ class HandFollowRobotNodeVerDepth(Node):
         # 넘지 않습니다. 10 Hz, 1.0 mm이면 명령 이동 속도 상한은
         # 약 10 mm/s입니다.
         self.declare_parameter("maximum_step_mm", 1.0)
+
+        # 연속된 두 servol 목표 사이의 XYZ 명령 속도 변화에 적용하는
+        # 가속도 한도 [mm/s²]입니다. 10 Hz, 20 mm/s²이면 한 주기마다
+        # 속도 벡터가 최대 2 mm/s씩만 변하므로 급격한 방향 반전을
+        # +속도 -> 0 -> -속도 순서로 부드럽게 만듭니다.
+        #
+        # 아래 servo_linear_acceleration은 두산 컨트롤러 내부 한도이고,
+        # 이 값은 컨트롤러에 보내기 전 목표 좌표 자체를 다듬는 외부
+        # 스무딩 한도라는 차이가 있습니다.
+        self.declare_parameter(
+            "command_linear_acceleration_mm_s2",
+            20.0,
+        )
 
         # servol의 최대 TCP 선속도 [mm/s]와 회전속도 [deg/s]입니다.
         self.declare_parameter("servo_linear_velocity", 30.0)
@@ -409,6 +555,18 @@ class HandFollowRobotNodeVerDepth(Node):
         self._origin_pose: Optional[Pose6] = None
         self._home_tcp_pose: Optional[Pose6] = None
         self._last_commanded_pose: Optional[Pose6] = None
+
+        # 최근 servol 목표 두 개의 차이로 만든 XYZ 명령 속도 [mm/s]입니다.
+        # 손 목표가 바뀔 때 smooth_linear_step()이 이 값을 기준으로
+        # 가속도와 방향 변화를 제한합니다.
+        self._commanded_linear_velocity: LinearVelocity3 = (
+            0.0,
+            0.0,
+            0.0,
+        )
+        # 실제 타이머 간격이 짧아진 경우에도 그 짧은 시간만큼만 속도와
+        # 위치를 변화시키기 위해 마지막 성공 명령 시각을 저장합니다.
+        self._last_tracking_command_at: Optional[float] = None
         self._motion_active = False
         self._faulted = False
         self._last_block_reason: Optional[str] = None
@@ -572,6 +730,23 @@ class HandFollowRobotNodeVerDepth(Node):
             f"Z={self._z_offset_min_mm:.1f}~"
             f"{self._z_offset_max_mm:.1f} mm"
         )
+        command_speed_limit = (
+            min(
+                self._maximum_step_mm * self._control_rate_hz,
+                self._servo_linear_velocity,
+            )
+        )
+        command_velocity_change = (
+            self._command_linear_acceleration_mm_s2
+            / self._control_rate_hz
+        )
+        self.get_logger().info(
+            "XYZ 명령 가속도 스무딩: "
+            f"목표점 속도 상한≈{command_speed_limit:.1f} mm/s, "
+            f"가속도 상한="
+            f"{self._command_linear_acceleration_mm_s2:.1f} mm/s², "
+            f"한 주기 속도 변화≤{command_velocity_change:.1f} mm/s"
+        )
         self.get_logger().warning(
             "현재 ±300 mm Y/Z 범위는 큰 시험 범위입니다. "
             "실제 장비에서는 주변 충돌과 네 모서리 도달 가능성을 먼저 "
@@ -666,6 +841,11 @@ class HandFollowRobotNodeVerDepth(Node):
         )
         self._maximum_step_mm = float(
             self.get_parameter("maximum_step_mm").value
+        )
+        self._command_linear_acceleration_mm_s2 = float(
+            self.get_parameter(
+                "command_linear_acceleration_mm_s2"
+            ).value
         )
         self._servo_linear_velocity = float(
             self.get_parameter("servo_linear_velocity").value
@@ -827,6 +1007,7 @@ class HandFollowRobotNodeVerDepth(Node):
                 self._control_rate_hz,
                 self._hand_timeout_sec,
                 self._maximum_step_mm,
+                self._command_linear_acceleration_mm_s2,
                 self._servo_linear_velocity,
                 self._servo_rotational_velocity,
                 self._servo_linear_acceleration,
@@ -888,6 +1069,7 @@ class HandFollowRobotNodeVerDepth(Node):
             self._control_rate_hz <= 0.0
             or self._hand_timeout_sec <= 0.0
             or self._maximum_step_mm <= 0.0
+            or self._command_linear_acceleration_mm_s2 <= 0.0
             or self._servo_linear_velocity <= 0.0
             or self._servo_rotational_velocity <= 0.0
             or self._servo_linear_acceleration <= 0.0
@@ -1243,6 +1425,7 @@ class HandFollowRobotNodeVerDepth(Node):
                 "전에는 노드를 initial_joint_pose에서 실행하세요."
             )
         self._last_commanded_pose = origin_pose.copy()
+        self._reset_command_smoothing()
         self._servol = servol
         self._posx = posx
         self.get_logger().info(
@@ -1380,12 +1563,69 @@ class HandFollowRobotNodeVerDepth(Node):
             self._origin_pose[5],
         ]
 
+    def _reset_command_smoothing(self) -> None:
+        """다음 추종이 정지 속도에서 시작하도록 XYZ 명령 속도를 지웁니다."""
+
+        self._commanded_linear_velocity = (0.0, 0.0, 0.0)
+        self._last_tracking_command_at = None
+
+    def _clamp_pose_to_tracking_workspace(
+        self,
+        pose: Sequence[float],
+        velocity: Sequence[float],
+    ) -> Tuple[Pose6, LinearVelocity3]:
+        """스무딩 중 관성으로 초기 TCP 상대 작업범위를 넘지 않게 합니다."""
+
+        if self._origin_pose is None:
+            raise RuntimeError("초기 TCP 원점 pose가 설정되지 않았습니다.")
+        if len(pose) < 6 or len(velocity) != 3:
+            raise ValueError("pose 6개와 XYZ 속도 3개가 필요합니다.")
+
+        x_offset_candidates = (
+            self._x_direction_sign * self._x_travel_min_mm,
+            self._x_direction_sign * self._x_travel_max_mm,
+        )
+        axis_bounds = (
+            (
+                self._origin_pose[0] + min(x_offset_candidates),
+                self._origin_pose[0] + max(x_offset_candidates),
+            ),
+            (
+                self._origin_pose[1] + self._y_offset_min_mm,
+                self._origin_pose[1] + self._y_offset_max_mm,
+            ),
+            (
+                self._origin_pose[2] + self._z_offset_min_mm,
+                self._origin_pose[2] + self._z_offset_max_mm,
+            ),
+        )
+
+        bounded_pose = [float(value) for value in pose]
+        bounded_velocity = [
+            float(component) for component in velocity
+        ]
+        for axis, (minimum, maximum) in enumerate(axis_bounds):
+            original_value = bounded_pose[axis]
+            bounded_pose[axis] = clamp(
+                original_value,
+                minimum,
+                maximum,
+            )
+            if bounded_pose[axis] != original_value:
+                # 작업범위 경계는 스무딩보다 우선하는 안전 제한입니다.
+                # 경계를 넘기려던 축 속도를 0으로 만들어 다음 주기에
+                # 같은 방향으로 계속 밀어내는 것을 방지합니다.
+                bounded_velocity[axis] = 0.0
+
+        return bounded_pose, tuple(bounded_velocity)
+
     def _set_fault(self, message: str) -> None:
         """복구할 수 없는 오류를 기록하고 자동 동작을 금지합니다."""
 
         if not self._faulted:
             self.get_logger().error(message)
         self._cancel_recovery_futures()
+        self._reset_command_smoothing()
         self._faulted = True
         self._follow_state = FollowState.FAULT
         self._request_soft_stop(message)
@@ -1476,6 +1716,9 @@ class HandFollowRobotNodeVerDepth(Node):
         if self._velocity_future is not None:
             self._velocity_future.cancel()
         self._velocity_future = None
+        # 이제 servol 목표를 보내지 않고 별도의 speedl(0) 감속으로
+        # 전환하므로 이전 추종 속도는 다음 재개에 사용하지 않습니다.
+        self._reset_command_smoothing()
 
         self._last_block_reason = reason
         self.get_logger().warning(
@@ -1502,6 +1745,7 @@ class HandFollowRobotNodeVerDepth(Node):
             self._resume_after_stop_requested = False
             self._follow_state = FollowState.TRACKING
             self._last_block_reason = None
+            self._reset_command_smoothing()
             self.get_logger().info(
                 "DRY RUN: 유효한 손 입력이 돌아와 추종을 재개합니다."
             )
@@ -1574,6 +1818,7 @@ class HandFollowRobotNodeVerDepth(Node):
             # 원점은 initial_joint_pose의 TCP에 그대로 두고, 한 주기
             # maximum_step_mm 제한의 시작점만 실제 정지 TCP로 맞춥니다.
             self._last_commanded_pose = actual_pose
+            self._reset_command_smoothing()
             self._tracking_loss_started_at = None
             self._holding_started_at = None
             self._resume_after_stop_requested = False
@@ -1622,6 +1867,7 @@ class HandFollowRobotNodeVerDepth(Node):
         self._holding_started_at = now
         self._follow_state = FollowState.HOLDING
         self._motion_active = False
+        self._reset_command_smoothing()
 
         self.get_logger().info(
             "TCP 속도가 0에 가까워졌습니다. 현재 위치를 유지하며 "
@@ -1837,6 +2083,7 @@ class HandFollowRobotNodeVerDepth(Node):
         if self._home_tcp_pose is not None:
             self._origin_pose = self._home_tcp_pose.copy()
             self._last_commanded_pose = self._home_tcp_pose.copy()
+        self._reset_command_smoothing()
 
         # 홈 이동 중 수신된 오래된 손 위치로 즉시 움직이지 않도록, 완료
         # 이후 들어오는 새 PointStamped를 한 번 더 기다립니다.
@@ -2257,12 +2504,22 @@ class HandFollowRobotNodeVerDepth(Node):
             if target_pose is None
             else str([round(value, 2) for value in target_pose])
         )
+        command_speed = math.sqrt(
+            sum(
+                component * component
+                for component in self._commanded_linear_velocity
+            )
+        )
         self.get_logger().info(
             "추종: "
             f"state={self._follow_state.value}, "
             f"hand=({hand[0]:.3f}, {hand[1]:.3f}, {hand[2]:+.3f}), "
             f"offset=({offsets[0]:+.1f}, "
             f"{offsets[1]:+.1f}, {offsets[2]:+.1f}) mm, "
+            f"cmd_v=({self._commanded_linear_velocity[0]:+.1f}, "
+            f"{self._commanded_linear_velocity[1]:+.1f}, "
+            f"{self._commanded_linear_velocity[2]:+.1f}) mm/s "
+            f"(|v|={command_speed:.1f}), "
             f"fist={self._fist}, target={target_text}"
         )
 
@@ -2289,15 +2546,48 @@ class HandFollowRobotNodeVerDepth(Node):
             return
 
         desired_pose = self._make_desired_pose(offsets)
-        limited_pose = limit_linear_step(
+        nominal_period_sec = 1.0 / self._control_rate_hz
+        if self._last_tracking_command_at is None:
+            control_period_sec = nominal_period_sec
+        else:
+            # 지연된 타이머가 연속 호출되더라도 실제로 지난 시간보다 큰
+            # 위치·속도 변화를 허용하지 않습니다. 반대로 긴 지연은 정상
+            # 한 주기까지만 인정해 한 번에 큰 목표 점프가 생기지 않게 합니다.
+            elapsed_sec = max(
+                now - self._last_tracking_command_at,
+                1.0e-6,
+            )
+            control_period_sec = min(
+                elapsed_sec,
+                nominal_period_sec,
+            )
+
+        # maximum_step_mm에서 유도한 속도와 servol의 최대 선속도 중 더
+        # 작은 값을 외부 명령 속도 상한으로 사용합니다. 따라서 사용자가
+        # step을 크게 올려도 servol 한도보다 빠른 목표열을 만들지 않습니다.
+        maximum_command_velocity_mm_s = min(
+            self._maximum_step_mm * self._control_rate_hz,
+            self._servo_linear_velocity,
+        )
+        smoothed_pose, smoothed_velocity = smooth_linear_step(
             self._last_commanded_pose,
             desired_pose,
+            self._commanded_linear_velocity,
+            maximum_command_velocity_mm_s,
             self._maximum_step_mm,
+            self._command_linear_acceleration_mm_s2,
+            control_period_sec,
+        )
+        smoothed_pose, smoothed_velocity = (
+            self._clamp_pose_to_tracking_workspace(
+                smoothed_pose,
+                smoothed_velocity,
+            )
         )
 
         try:
             result = self._servol(
-                self._posx(limited_pose),
+                self._posx(smoothed_pose),
                 vel=[
                     self._servo_linear_velocity,
                     self._servo_rotational_velocity,
@@ -2311,9 +2601,11 @@ class HandFollowRobotNodeVerDepth(Node):
             if result != 0:
                 raise RuntimeError(f"servol 반환값={result}")
 
-            self._last_commanded_pose = limited_pose
+            self._last_commanded_pose = smoothed_pose
+            self._commanded_linear_velocity = smoothed_velocity
+            self._last_tracking_command_at = now
             self._motion_active = True
-            self._log_status(now, offsets, target_pose=limited_pose)
+            self._log_status(now, offsets, target_pose=smoothed_pose)
         except Exception as error:
             self._set_fault(
                 f"servol 명령 중 오류가 발생했습니다: {error}"
@@ -2354,6 +2646,7 @@ class HandFollowRobotNodeVerDepth(Node):
 
             self._follow_state = FollowState.TRACKING
             self._last_block_reason = None
+            self._reset_command_smoothing()
             self.get_logger().info(
                 "새로운 유효한 손 위치를 받아 추종을 시작합니다."
             )
