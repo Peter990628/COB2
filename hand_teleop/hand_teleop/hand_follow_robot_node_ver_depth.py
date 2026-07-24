@@ -506,10 +506,10 @@ class HandFollowRobotNodeVerDepth(Node):
         #
         # 주의: 80.0 mm는 raw width=800입니다. RG2의 전체 폭 범위는
         # 0~110 mm이고 공식 파지력 범위는 3~40 N입니다.
-        self.declare_parameter("gripper.open_width_mm", 80.0)
-        self.declare_parameter("gripper.open_force_n", 30.0)
-        self.declare_parameter("gripper.closed_width_mm", 2.0)
-        self.declare_parameter("gripper.closed_force_n", 30.0)
+        self.declare_parameter("gripper.open_width_mm", 30.0)
+        self.declare_parameter("gripper.open_force_n", 40.0)
+        self.declare_parameter("gripper.closed_width_mm", 1.0)
+        self.declare_parameter("gripper.closed_force_n", 40.0)
 
         # Modbus 한 번의 통신 제한시간과 그리퍼 동작 완료 대기 제한시간입니다.
         self.declare_parameter("gripper.modbus_timeout_sec", 1.0)
