@@ -31,6 +31,7 @@ setup(
             'jog_complete = peter.jog_complete:main',
             'get_current_pose = peter.get_current_pose:main',
             'move_plate = peter.move_plate:main',
+            'paddle_ocr_test = peter.paddle_ocr_test:main',
         ],
     },
 )

@@ -20,6 +20,7 @@ install(
     scripts/gripper_test
     scripts/jog_complete
     scripts/move_plate
+    scripts/paddle_ocr_test
   DESTINATION lib/${PROJECT_NAME}
 )
 
