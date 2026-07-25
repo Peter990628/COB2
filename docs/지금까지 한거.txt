@@ -1,0 +1,520 @@
+가능합니다. 현재 구현은 크게 `음료 픽앤플레이스`, `손동작 로봇 추종`, `접시 이동 시험`의 세 흐름으로 발전했습니다.
+
+```text
+[음료]
+YOLO 거친 좌표
+ → RealSense RGB/Depth
+ → OpenCV 원 중심 보정
+ → Camera→BASE 좌표 변환
+ → 수직 파지
+ → 안전 운반
+ → 트레이 배치
+
+[손 추종]
+2D 웹캠
+ → MediaPipe 손 랜드마크
+ → X/Y + 상대 깊이 Z + 주먹 판정
+ → ROS 토픽
+ → 속도·가속도 스무딩
+ → Doosan servol
+ → RG2 제어
+
+[접시]
+고정 관절 자세
+ → 그리퍼 파지
+ → 고정 상대이동
+ → 배치
+```
+
+## 1. `opencv_center_test.py`
+
+[opencv_center_test.py](/home/peter-msi/cobot_ws/src/beverage/bev/hotel_vision/opencv_center_test.py:1)은 로봇을 움직이지 않고 캔 윗면 검출 조건을 맞추기 위해 만든 보정용 노드입니다.
+
+### 만들게 된 과정
+
+처음에는 YOLO가 준 캔 좌표로 바로 이동하려 했습니다. 하지만 손목에 장착된 RealSense가 그리퍼 중심과 일치하지 않아, 실제 파지 중심에 캔이 있을 때 영상에서는 캔이 화면 중앙보다 오른쪽 아래에 나타났습니다.
+
+그래서 먼저 다음 값을 실측할 필요가 있었습니다.
+
+- 그리퍼 파지 중심에 대응하는 영상 픽셀
+- 원 검출을 실행할 ROI
+- Hough Circle의 반지름·민감도
+- 검출된 원의 Depth와 실제 크기
+
+### 구현 흐름
+
+1. RealSense RGB, aligned Depth, CameraInfo를 구독합니다.
+2. RGB와 Depth의 시간 차이가 0.08초 이하인지 검사합니다.
+3. 비율로 정의한 ROI만 잘라냅니다.
+4. grayscale → CLAHE → median blur 처리를 합니다.
+5. `cv2.HoughCircles()`로 원 후보를 검출합니다.
+6. 원 내부 Depth의 중앙값을 구합니다.
+7. MAD로 튀는 Depth를 제거합니다.
+8. 픽셀 반지름과 초점거리로 실제 지름을 계산합니다.
+9. ROI 기준점에 가깝고 캔 지름 66mm에 가까운 후보를 선택합니다.
+
+원 검출 구현은 [detect_can_top_circle()](/home/peter-msi/cobot_ws/src/beverage/bev/hotel_vision/opencv_center_test.py:177)에 있습니다.
+
+화면 표시는 다음 의미입니다.
+
+- 자홍색 사각형: ROI
+- 흰색 십자: 영상 전체 중앙
+- 빨간 십자: 실제 파지 중심으로 지정한 ROI 기준점
+- 노란 원: 검출된 모든 원 후보
+- 초록 원: 최종 선택된 캔
+- 빨간 점: 선택된 원 중심
+
+`S`를 누르면 20프레임을 기록하고 중앙값을 계산합니다. 중심 흔들림이나 Depth 변화가 너무 크면 표본을 폐기합니다: [finish_recording()](/home/peter-msi/cobot_ws/src/beverage/bev/hotel_vision/opencv_center_test.py:572).
+
+현재 ROI 중심은 화면 비율로 `X=0.6508`, `Y=0.8236`입니다. 해상도가 바뀌어도 같은 비율로 적용되도록 픽셀값이 아니라 비율로 저장했습니다.
+
+### 해결한 문제
+
+- 카메라 중심과 그리퍼 중심 불일치 → 실제 파지 위치에서 ROI 중심 실측
+- 금속 캔 반사로 Depth가 튐 → 원 내부 다중 픽셀 중앙값과 MAD 필터
+- 식혜 캔 원 검출 누락 → Hough 민감도 조정
+- 여러 원이 동시에 검출됨 → ROI 중심 거리와 실제 지름 점수로 최종 후보 선택
+
+다만 ROI와 Hough 설정은 촬영 높이가 변하면 다시 검증해야 합니다.
+
+---
+
+## 2. `move_to_bev_opencv.py`
+
+[move_to_bev_opencv.py](/home/peter-msi/cobot_ws/src/beverage/bev/hotel_vision/move_to_bev_opencv.py:1)은 YOLO의 거친 좌표를 받아 캔을 정밀하게 수직 파지하고 트레이에 놓는 1회성 실행 노드입니다.
+
+서비스 서버는 아니며 좌표 하나를 받아 전체 작업을 수행한 뒤 종료합니다.
+
+### 전체 동작 순서
+
+1. `/dsr01` 로봇 노드를 생성합니다.
+2. `DR_init.__dsr__node`를 등록한 뒤 `DSR_ROBOT2`를 import합니다.
+3. 트레이 좌표와 작업공간을 미리 검사합니다.
+4. `T_flange_camera.npy` 손–카메라 보정행렬을 검사합니다.
+5. 초기 관절 자세로 `movej`합니다.
+6. RG2를 엽니다.
+7. `/checkin/beverage_position`의 새 좌표를 기다립니다.
+8. 현재 XY에서 먼저 안전 높이로 상승합니다.
+9. 안전 높이에서 TCP를 아래 방향 `ABC=[90,-180,-90]`으로 정렬합니다.
+10. 캔의 거친 X/Y 위로 수평 이동합니다.
+11. 캔 Z+80mm 촬영 높이로 내려갑니다.
+12. OpenCV로 원 중심과 Depth 5개를 수집합니다.
+13. Camera 좌표를 BASE 좌표로 변환합니다.
+14. 정밀 X/Y 위로 이동합니다.
+15. 계산된 파지 높이까지 천천히 하강합니다.
+16. RG2로 캔을 잡고 같은 거리만큼 상승합니다.
+17. 안전 운반 높이까지 먼저 수직 상승합니다.
+18. 트레이 위로 수평 이동합니다.
+19. 트레이용 자세로 회전합니다.
+20. 접근점과 release Z까지 하강합니다.
+21. 그리퍼를 열고 안전 높이로 후퇴합니다.
+
+실제 로봇 동작은 [main()](/home/peter-msi/cobot_ws/src/beverage/bev/hotel_vision/move_to_bev_opencv.py:617)에 순서대로 구현돼 있습니다.
+
+### 개발 중 막혔던 부분
+
+#### `DSR_ROBOT2`의 `g_node=None`
+
+처음에는 다음 오류가 발생했습니다.
+
+```text
+AttributeError: 'NoneType' object has no attribute 'create_client'
+```
+
+`DSR_ROBOT2`가 import되는 순간 ROS 서비스 클라이언트를 만들기 때문입니다. 현재는 노드를 먼저 생성하고 `DR_init.__dsr__node`에 넣은 다음 import하도록 순서를 고쳤습니다.
+
+#### `trans()`가 거대한 이상 좌표를 반환
+
+BASE 절대 pose와 TOOL 상대 이동, NumPy 배열을 잘못 섞으면서 비정상적으로 큰 좌표가 나온 적이 있었습니다.
+
+이를 다음과 같은 명시적인 변환으로 변경했습니다.
+
+```text
+P_base =
+    T_base_flange
+  × T_flange_camera
+  × P_camera
+```
+
+구현은 [transform_camera_point_to_base()](/home/peter-msi/cobot_ws/src/beverage/bev/hotel_vision/move_to_bev_opencv.py:203)에 있습니다.
+
+- 카메라 내부 파라미터로 픽셀+Depth를 카메라 XYZ로 역투영
+- Doosan ABC를 ZYZ Euler 회전행렬로 변환
+- hand-eye calibration 행렬로 Flange→Camera 변환
+- 최종적으로 BASE 좌표 계산
+
+#### 캔 옆으로 이동하는 문제
+
+YOLO bounding box 대표 좌표는 캔의 정확한 파지 중심이 아니었습니다. 그래서 YOLO는 캔 근처까지 접근하는 데만 사용하고, 캔 위에서 OpenCV 원 검출로 다시 정밀 측정하는 2단계 구조로 바꿨습니다.
+
+#### 하강량이 음수로 계산됨
+
+다음과 같은 오류도 있었습니다.
+
+```text
+계산한 하강량 -16.4 mm가 허용 범위 밖입니다
+캔 윗면 높이 차 -7.4 mm가 허용 범위 밖입니다
+```
+
+TCP 원점, 캔 윗면 높이, 카메라 촬영 높이의 관계가 맞지 않았기 때문입니다. 현재는 다음 식으로 계산합니다.
+
+```text
+파지 TCP Z =
+    OpenCV로 검출한 캔 윗면 BASE Z
+  + GRASP_TCP_Z_OFFSET_FROM_CAN_TOP_MM
+```
+
+그리고 하강량이 5~120mm 안에 있을 때만 움직입니다.
+
+#### 캔을 잡은 뒤 대각선 이동
+
+처음에는 캔을 잡은 위치에서 트레이까지 대각선으로 움직였습니다. 캔이나 주변 장애물을 끌고 갈 수 있어 현재는 다음처럼 분리했습니다.
+
+```text
+현재 XY에서 상승
+ → 안전 높이 수평 이동
+ → 트레이 위에서 자세 변경
+ → 수직 하강
+```
+
+### 사용 기술
+
+- ROS 2 Humble, `rclpy`
+- Intel RealSense D435i RGB-D
+- `cv_bridge`
+- OpenCV CLAHE, median blur, Hough Circle
+- NumPy 중앙값·MAD·동차좌표
+- SciPy `Rotation`
+- Hand-eye calibration
+- Doosan `movej`, `movel`, `get_current_posx`
+- OnRobot RG2 Modbus TCP
+
+### 현재 확인해야 할 사항
+
+현재 파일에는 위험 동작이 실제로 활성화돼 있습니다.
+
+```python
+ENABLE_FINAL_DESCENT_AND_GRIP = True
+ENABLE_TRAY_PLACE = True
+```
+
+또한 현재 `PLACE_APPROACH_POSE`는 이전에 제공했던 커피 좌표와 동일합니다. 실제 트레이 접근 좌표가 맞는지 다시 확인해야 합니다.
+
+현재 RG2 설정도 처음 논의했던 62~64mm/약 3N이 아니라:
+
+- 목표 폭 50mm
+- 힘 20N
+
+입니다. 실제 캔과 손가락 구조에 맞게 다시 확인해야 합니다.
+
+---
+
+## 3. `hand_tracker_node.py`
+
+[hand_tracker_node.py](/home/peter-msi/cobot_ws/src/hand_teleop/hand_teleop/hand_tracker_node.py:1)은 일반 2D 웹캠 영상에서 손의 X/Y 위치와 주먹 여부를 발행하는 인식 전용 노드입니다. 로봇은 직접 움직이지 않습니다.
+
+### 구현 흐름
+
+```text
+USB 웹캠
+ → OpenCV VideoCapture
+ → 필요 시 좌우 반전
+ → BGR→RGB
+ → MediaPipe Hand Landmarker
+ → 21개 손 랜드마크
+ → 손바닥 중심·주먹 판정
+ → 필터링
+ → ROS 토픽 발행
+```
+
+### 손 중심 계산
+
+손가락 끝 한 점은 손을 펴고 접을 때 위치가 크게 달라집니다. 그래서 다음 다섯 랜드마크 평균을 사용했습니다.
+
+- 손목 0번
+- 검지 MCP 5번
+- 중지 MCP 9번
+- 약지 MCP 13번
+- 소지 MCP 17번
+
+그 후 EMA 저역통과 필터를 적용합니다.
+
+```text
+filtered =
+    alpha × 새 좌표
+  + (1-alpha) × 이전 좌표
+```
+
+기본 `alpha=0.25`입니다: [_low_pass_filter()](/home/peter-msi/cobot_ws/src/hand_teleop/hand_teleop/hand_tracker_node.py:452).
+
+### 주먹 판정
+
+엄지를 제외한 네 손가락에 대해 손끝이 PIP 관절보다 손바닥 중심에 가까운지 검사합니다.
+
+기본적으로 네 손가락 중 세 개 이상이 접혔다고 판단되면 raw fist입니다. 순간적인 오검출을 막기 위해:
+
+- 주먹 8프레임 연속 → 주먹 확정
+- 편 손 3프레임 연속 → 주먹 해제
+
+방식을 사용합니다.
+
+### 발행 토픽
+
+- `/hand_teleop/hand_position`
+  - X/Y: 0~1 정규화 좌표
+  - Z: 0
+- `/hand_teleop/hand_detected`
+- `/hand_teleop/fist`
+
+손을 잃으면 가짜 `(0,0)` 위치를 발행하지 않고 `detected=False`만 보냅니다. 재검출 시 이전 필터 값으로 좌표가 튀지 않도록 필터도 초기화합니다.
+
+---
+
+## 4. `hand_tracker_node_ver_depth.py`
+
+[hand_tracker_node_ver_depth.py](/home/peter-msi/cobot_ws/src/hand_teleop/hand_teleop/hand_tracker_node_ver_depth.py:1)은 기본 손 추적 노드를 상속해 상대적인 앞뒤 깊이와 UI 영상을 추가한 버전입니다.
+
+### 왜 RealSense Depth가 아닌 상대 깊이를 사용했나
+
+사람은 별도의 2D 웹캠 앞에서 손을 움직이고, 로봇팔의 RealSense는 벽 쪽을 바라보게 됩니다. 그래서 사람 손의 앞뒤 움직임은 2D 웹캠 영상에서 손바닥 크기로 추정했습니다.
+
+이 Z는 mm 단위 실제 거리가 아닙니다.
+
+### 상대 깊이 계산
+
+손바닥 크기는 다음 두 거리의 기하평균입니다.
+
+- 폭: 랜드마크 5↔17
+- 높이: 랜드마크 0↔9
+
+```text
+palm_size = sqrt(width × height)
+```
+
+노드 시작 후 편 손을 중립 거리에서 기본 45프레임 유지합니다. 그 중앙값을 기준 손 크기로 저장합니다.
+
+```text
+delta = 현재 손 크기 / 기준 손 크기 - 1
+```
+
+- ±4% 이내: Z=0 데드존
+- 기준보다 커짐: 카메라에 가까움, Z 양수
+- 기준보다 작아짐: 카메라에서 멀어짐, Z 음수
+- 최종 범위: -1~+1
+- Z EMA 계수: 0.20
+
+### 추가 토픽
+
+- `/hand_teleop/depth_valid`
+- `/hand_teleop/annotated_image`
+
+`annotated_image`에는 OpenCV 창과 같은 손 랜드마크, 중심점, 주먹, 상대 깊이가 그려집니다. `cv_bridge` 대신 `sensor_msgs/Image`를 직접 구성해 당시 NumPy 2와 ROS Humble `cv_bridge` ABI 충돌을 피했습니다: [_publish_annotated_frame()](/home/peter-msi/cobot_ws/src/hand_teleop/hand_teleop/hand_tracker_node_ver_depth.py:435).
+
+깊이 보정 전에도 X/Y는 발행하지만 Z=0, `depth_valid=False`로 보냅니다. 따라서 follower는 Z값만 보지 않고 반드시 `depth_valid`를 함께 확인합니다.
+
+---
+
+## 5. `hand_follow_robot_node_ver_depth.py`
+
+[hand_follow_robot_node_ver_depth.py](/home/peter-msi/cobot_ws/src/hand_teleop/hand_teleop/hand_follow_robot_node_ver_depth.py:1)은 손 추적 토픽을 실제 M0609와 RG2 명령으로 바꾸는 실행 노드입니다.
+
+### 좌표 변환
+
+초기 자세:
+
+```text
+[-90, 0, 90, -90, 90, 90]
+```
+
+도착 후 실제 TCP pose를 읽어 추종 원점으로 저장합니다.
+
+현재 매핑은 다음과 같습니다.
+
+- 화면 오른쪽 `+X` → 로봇 BASE `+Y`
+- 화면 아래 `+Y` → 로봇 BASE `-Z`
+- 손이 카메라에 가까움 `+Z` → 로봇 BASE `-X`
+
+목표는 매번 초기 TCP로부터 계산하므로 상대 명령을 계속 더해서 생기는 누적 오차가 없습니다. TCP의 A/B/C는 시작 자세로 고정됩니다: [_make_desired_pose()](/home/peter-msi/cobot_ws/src/hand_teleop/hand_teleop/hand_follow_robot_node_ver_depth.py:1547).
+
+현재 워크스페이스의 기본 범위는:
+
+- X 전진: 0~250mm
+- Y: -250~250mm
+- Z: -250~250mm
+
+입니다.
+
+### 로봇이 “탁탁” 움직였던 문제
+
+초기 follower 커밋에는 실제로 “로봇이 툭툭 끊기는 느낌 있음”이라는 기록이 남아 있습니다.
+
+원인은 크게 두 가지였습니다.
+
+1. X/Y/Z를 축별로 각각 제한하면 대각선 전체 이동량은 더 커짐
+2. 손 목표가 반대로 바뀌면 속도 방향도 한 주기 만에 반전됨
+
+첫 번째 해결로 축별 제한을 XYZ 벡터 전체 길이 제한으로 변경했습니다.
+
+```text
+||ΔXYZ|| ≤ maximum_step_mm
+```
+
+그리고 기본 step을 5mm에서 1mm로 줄였습니다: [limit_linear_step()](/home/peter-msi/cobot_ws/src/hand_teleop/hand_teleop/hand_follow_robot_node_ver_depth.py:174).
+
+### 속도·가속도 스무딩
+
+[smooth_linear_step()](/home/peter-msi/cobot_ws/src/hand_teleop/hand_teleop/hand_follow_robot_node_ver_depth.py:204)은 다음 순서로 계산합니다.
+
+1. 남은 목표 거리와 방향 계산
+2. 최대 속도 계산
+3. 목표 근처에서 정지할 수 있는 속도 `sqrt(2as)` 적용
+4. 이전 속도에서 이번 속도로 변할 수 있는 벡터 크기 제한
+5. 새 pose 계산
+6. 다시 step과 작업공간 제한
+
+기본 설정:
+
+- 제어 주기: 10Hz
+- 최대 step: 1mm
+- 실질 명령 속도: 약 10mm/s
+- 명령 가속도: 20mm/s²
+- 한 주기 속도 변화: 최대 2mm/s
+
+이것은 가속도 제한 스무딩이며 jerk 제한은 아직 구현돼 있지 않습니다.
+
+스무딩은 [test_motion_smoothing.py](/home/peter-msi/cobot_ws/src/hand_teleop/test/test_motion_smoothing.py:1)에서 방향 반전, 대각선 벡터, 오버슈트, 짧은 제어주기 등을 시험했습니다.
+
+### 손 유실 복구 상태 머신
+
+```text
+WAITING_FOR_HAND
+ → TRACKING
+ → DECELERATING
+ → HOLDING
+ → RETURNING_HOME
+ → WAITING_FOR_HAND
+```
+
+손, Depth 또는 위치 토픽이 유실되면:
+
+1. 새로운 `servol`을 중단합니다.
+2. `speedl(0)`으로 감속합니다.
+3. `get_current_velx`로 실제 정지를 확인합니다.
+4. 잠시 현재 위치를 유지합니다.
+5. 손이 돌아오면 실제 TCP에서 추종을 재개합니다.
+6. 계속 보이지 않으면 초기 관절 자세로 저속 복귀합니다.
+
+fault나 종료에서는 자동 홈 복귀 대신 `DR_SSTOP`을 요청합니다.
+
+### RG2 제어
+
+주먹 토픽에 따라:
+
+- 편 손 → OPEN
+- 주먹 → CLOSE
+
+명령을 보냅니다.
+
+Modbus 통신이 `servol` 제어 주기를 막지 않도록 별도 작업 스레드에서 실행합니다. 같은 상태를 매 프레임 반복 전송하지 않고 OPEN↔CLOSE 상태가 바뀔 때만 명령합니다.
+
+손을 놓쳤을 때는 물체를 떨어뜨리지 않도록 마지막 그리퍼 상태를 유지합니다.
+
+### 현재 남아 있는 문제
+
+- 실제 기본 그리퍼 값은 `OPEN=30mm/40N`, `CLOSE=1mm/40N`인데 파일 상단 설명은 아직 `80/30`, `2/30`으로 적혀 있습니다.
+- 경고 로그는 ±300mm라고 하지만 실제 기본값은 ±250mm입니다.
+- 현재 `cobot_ws`와 `~/COB2` 복사본의 이동 범위가 서로 다릅니다.
+- 자동 홈은 MoveIt 경로계획이 아닌 단순 관절 `amovej`입니다.
+- `speedl(0)`에서 홈 `amovej`로 전환할 때 스트리밍 모드가 완전히 종료됐는지 추가 확인이 필요합니다.
+- soft stop 실패는 0.5초 간격으로 재시도하며 최대 횟수 제한은 없습니다.
+- 앞서 발생한 heartbeat timeout은 이 Python 노드가 아닌 `dsr_bringup2`/DRFL 또는 네트워크 쪽 문제입니다.
+
+---
+
+## 6. `hand_teleop/onrobot.py`
+
+[onrobot.py](/home/peter-msi/cobot_ws/src/hand_teleop/hand_teleop/onrobot.py:1)은 ROS 노드가 아니라 RG2 전용 Modbus TCP 드라이버입니다.
+
+기존 드라이버의 raw 단위 혼동을 줄이기 위해 만들었습니다.
+
+```text
+80.0mm → raw 800
+30.0N  → raw 300
+```
+
+기능은 다음과 같습니다.
+
+- RG2 `192.168.1.1:502` 연결
+- 폭 0~110mm 검사
+- 힘 3~40N 검사
+- 상태 레지스터 268 읽기
+- busy, grip detected, safety bit 해석
+- 레지스터 0~2에 힘·폭·명령 기록
+- 연결 종료
+
+`grip_detected`와 안전 스위치는 서로 다른 비트입니다. 물체를 잡았다는 것은 보통 목표 폭으로 완전히 닫히지 못하고 내부 또는 외부 파지가 감지됐다는 뜻이며, 안전 버튼이 눌렸다는 의미가 아닙니다.
+
+---
+
+## 7. `move_plate.py`
+
+[move_plate.py](/home/peter-msi/cobot_ws/src/cobot_pjt/peter/move_plate.py:1)은 실행 즉시 정해진 순서를 한 번 수행하고 종료하는 초기 시험 노드입니다.
+
+```text
+그리퍼 연결
+ → open/close 시험
+ → home movej
+ → 접시 파지 자세 movej
+ → close
+ → BASE +X 508.63mm 상대 movel
+ → open
+ → 종료
+```
+
+처음 `ros2 run` 목록에 나타나지 않았던 문제는 실행 래퍼와 CMake 설치 설정이 없었기 때문입니다. 현재는 [scripts/move_plate](/home/peter-msi/cobot_ws/src/cobot_pjt/scripts/move_plate:1)와 [CMakeLists.txt](/home/peter-msi/cobot_ws/src/cobot_pjt/CMakeLists.txt:14)에 설치 설정이 들어가 있습니다.
+
+현재 중요한 문제는 다음 명령입니다.
+
+```python
+movel(
+    posx(508.63, 0, 0, 0, 0, 0),
+    ref=DR_BASE,
+    mod=DR_MV_MOD_REL,
+)
+```
+
+이것은 절대 X=508.63mm가 아니라 현재 위치에서 BASE +X로 508.63mm 이동하라는 뜻입니다. 상당히 큰 상대 이동입니다.
+
+또한 현재 `move_plate`는:
+
+- 그리퍼 open 직후 wait 없이 close
+- RG2 busy와 파지 성공 미확인
+- 로봇 명령 반환값 미확인
+- 작업공간 제한 없음
+- dry run 없음
+- 안전 상승·중간 경유점 없음
+- 예외 시 그리퍼 연결 종료가 보장되지 않음
+
+상태라서 통합용 코드보다는 초기 기능 확인용 초안에 가깝습니다.
+
+특히 `move_plate`는 새 [hand_teleop/onrobot.py](/home/peter-msi/cobot_ws/src/hand_teleop/hand_teleop/onrobot.py:1)가 아니라 예전 [peter/onrobot.py](/home/peter-msi/cobot_ws/src/cobot_pjt/peter/onrobot.py:1)를 사용하고 있습니다.
+
+## 전체적으로 사용한 기술
+
+- Ubuntu 22.04, ROS 2 Humble, Python 3.10
+- `rclpy`, ament_python, ament_cmake
+- Doosan `DSR_ROBOT2`, `dsr_msgs2`
+- Intel RealSense RGB-D
+- OpenCV, NumPy, SciPy
+- MediaPipe Tasks Hand Landmarker
+- YOLO/Ultralytics
+- Hand-eye calibration
+- Modbus TCP, OnRobot RG2
+- EMA 필터, temporal debounce
+- Hough Circle, CLAHE, MAD 이상치 제거
+- 벡터 속도·가속도 제한
+- 상태 머신과 비동기 ROS 서비스
+- pytest 단위 시험
+- ROS Image 토픽을 통한 UI 통합
+
+개발 흐름을 한 문장으로 정리하면, 처음에는 “고정 좌표로 로봇을 움직이는 코드”에서 시작했고, 이후 센서 노이즈·좌표계 혼동·파지 확인·급격한 움직임·손 유실·UI 통합 문제를 하나씩 만나면서 `보정 → 검증 → 스무딩 → 상태 머신 → 장치별 스레드 분리` 구조로 발전한 프로젝트입니다.
